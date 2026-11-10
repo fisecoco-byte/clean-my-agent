@@ -77,7 +77,10 @@ try {
     }
     $pending = Join-Path $InstallDir ('.install-' + [Guid]::NewGuid().ToString('N') + '.exe')
     Copy-Item $candidate $pending
-    if (Test-Path $target) { [IO.File]::Replace($pending, $target, $null) } else { [IO.File]::Move($pending, $target) }
+    # PowerShell can coerce $null to an empty string for this .NET argument.
+    # Use a real backup path; the verified replacement is atomic and the scratch
+    # directory (including this previous executable) is removed below.
+    if (Test-Path $target) { [IO.File]::Replace($pending, $target, (Join-Path $scratch 'previous.exe')) } else { [IO.File]::Move($pending, $target) }
     Set-Content $marker $target -Encoding UTF8
     if (!$NoPath) {
         if (!($entries | Where-Object { $_.TrimEnd('\') -ieq $InstallDir.TrimEnd('\') })) {
