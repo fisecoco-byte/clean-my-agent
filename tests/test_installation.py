@@ -100,7 +100,7 @@ class PortableTests(unittest.TestCase):
         from unittest.mock import patch
         from clean_my_agent.cli import configure_output
         data=io.BytesIO()
-        output=io.TextIOWrapper(data,encoding='cp1252')
+        output=io.TextIOWrapper(data,encoding='cp1252',newline='\n')
         with patch('clean_my_agent.cli.os.name','nt'), patch('clean_my_agent.cli.sys.stdout',output), \
              patch('clean_my_agent.cli.sys.stderr',output):
             configure_output()
