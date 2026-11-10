@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clean-my-agent"
+dynamic = ["version"]
+description = "Inspect and safely clean local Codex and Claude Code storage"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.scripts]
+clean-my-agent = "clean_my_agent.cli:main"
+clean-my-agent-mcp = "clean_my_agent.mcp_server:main"
+
+[tool.setuptools]
+packages = ["clean_my_agent"]
+
+[tool.setuptools.dynamic]
+version = {attr = "clean_my_agent.__version__"}
+
+[project.urls]
+Homepage = "https://github.com/fisecoco-byte/clean-my-agent"
+Releases = "https://github.com/fisecoco-byte/clean-my-agent/releases"
+
+[project.optional-dependencies]
+ui = ["textual>=8.2,<9", "rich>=14.2,<16"]
+mcp = ["mcp>=2.3,<3"]

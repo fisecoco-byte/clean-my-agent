@@ -1,0 +1,11 @@
+include clean-my-agent
+include scripts/install-agent.sh
+include install.sh install.ps1
+recursive-include scripts *.py
+include scripts/build-linux-container.sh
+recursive-include .github *.yml
+recursive-include skills *.md *.yaml
+recursive-include docs *.md *.png *.svg
+include dev/capture-ui.py
+recursive-include dev/pie *.mjs *.json *-LICENSE
+prune dev/pie/node_modules

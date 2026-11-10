@@ -1,0 +1,4 @@
+interface:
+  display_name: "Clean My Agent"
+  short_description: "盘点 Codex 和 Claude Code 占用，核对共享依赖与可回收空间"
+  default_prompt: "用 $clean-my-agent 查看本机 Agent 占用，列出最值得清理的候选和原因。"
