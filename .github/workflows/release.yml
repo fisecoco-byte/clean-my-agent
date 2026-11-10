@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {runner: macos-14, target: macos-arm64}
+          - {runner: macos-15, target: macos-arm64}
           - {runner: macos-15-intel, target: macos-x64}
           - {runner: ubuntu-22.04, target: linux-x64}
           - {runner: ubuntu-22.04-arm, target: linux-arm64}
@@ -119,10 +119,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-14, macos-15-intel, ubuntu-22.04, ubuntu-22.04-arm, windows-2022]
+        runner: [macos-15, macos-15-intel, ubuntu-22.04, ubuntu-22.04-arm, windows-2022]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install latest from the public curl entry point
         if: runner.os != 'Windows'
         shell: bash

@@ -42,7 +42,7 @@ macOS / Linux 首次安装后重新打开终端，让 `PATH` 生效。安装器�
 
 包内安装脚本识别本地程序，安装阶段无需联网。也可以直接执行包内程序进行便携使用。PowerShell 的 `Bypass` 参数仅作用于这次安装进程，不改系统执行策略。
 
-Linux 包基于 Ubuntu 22.04 构建，需要 glibc 2.35+，适用于 Ubuntu 22.04 / 24.04 等系统；Alpine / musl 暂不支持。macOS 构建验证环境为 Apple Silicon macOS 14 和 Intel macOS 15。Windows 验证目标为 Windows x64，ARM64 暂不提供原生包。
+Linux 包基于 Ubuntu 22.04 构建，需要 glibc 2.35+，适用于 Ubuntu 22.04 / 24.04 等系统；Alpine / musl 暂不支持。macOS 构建验证环境为 Apple Silicon macOS 15 和 Intel macOS 15。Windows 验证目标为 Windows x64，ARM64 暂不提供原生包。
 
 当前发布流程未配置 Apple 公证或 Windows Authenticode 签名。直接从浏览器下载时，系统可能提示未识别开发者；校验值用于核对发布文件，不等同于代码签名。正式分发需由仓库维护者提供签名证书后接入签名步骤。
 
