@@ -95,6 +95,28 @@ esac
 
 
 class PortableTests(unittest.TestCase):
+    def test_walk_handles_directory_entries_without_device_identity(self):
+        from clean_my_agent import portable
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp).resolve()
+            path=root/'log/old.log'; path.parent.mkdir()
+            path.write_bytes(b'x'*4096)
+            real_scandir=os.scandir
+            class EntriesWithoutIdentity:
+                def __init__(self, path):
+                    self.entries=real_scandir(path)
+                def __enter__(self):
+                    return [SimpleNamespace(name=e.name,path=e.path,
+                        stat=lambda **kw: SimpleNamespace(st_dev=0,st_ino=0)) for e in self.entries]
+                def __exit__(self,*args):
+                    self.entries.close()
+            with patch.object(portable.os,'scandir',EntriesWithoutIdentity):
+                result=portable.scan({'codex':root},{'codex'},object(),full=True)
+            self.assertFalse(result.errors)
+            self.assertEqual(result.rows['codex','logs'][1],portable.allocated(path))
+
     def test_readonly_walk_pruning_hardlinks_and_unknown_reclaim(self):
         from clean_my_agent import portable, policy
         with tempfile.TemporaryDirectory() as temp:
@@ -109,6 +131,7 @@ class PortableTests(unittest.TestCase):
             (other/'pkg').write_text('dependency')
             rules=object()  # This adapter never authorizes a cleanup candidate.
             doc=portable.scan({'codex':root},{'codex'},rules,full=True)
+            self.assertFalse(doc.errors)
             self.assertFalse(doc.items)
             self.assertEqual(doc.rows['codex','logs'][1],portable.allocated(p))
             quick=portable.scan({'codex':root},{'codex'},rules,full=False)

@@ -83,7 +83,9 @@ def walk(root, errors):
             dirs, files = [], []
             with os.scandir(parent) as entries:
                 for entry in entries:
-                    s = entry.stat(follow_symlinks=False)
+                    # DirEntry.stat on Windows may omit device / inode values.
+                    # Compare identities from lstat on both sides of the check.
+                    s = Path(entry.path).lstat()
                     if linked(s) or s.st_dev != info.st_dev:
                         continue
                     if stat.S_ISDIR(s.st_mode):
