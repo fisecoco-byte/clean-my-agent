@@ -95,6 +95,19 @@ esac
 
 
 class PortableTests(unittest.TestCase):
+    def test_windows_output_is_utf8_even_with_a_legacy_system_codepage(self):
+        import io
+        from unittest.mock import patch
+        from clean_my_agent.cli import configure_output
+        data=io.BytesIO()
+        output=io.TextIOWrapper(data,encoding='cp1252')
+        with patch('clean_my_agent.cli.os.name','nt'), patch('clean_my_agent.cli.sys.stdout',output), \
+             patch('clean_my_agent.cli.sys.stderr',output):
+            configure_output()
+            print('存储盘点')
+            output.flush()
+        self.assertEqual(data.getvalue().decode('utf-8'),'存储盘点\n')
+
     def test_walk_handles_directory_entries_without_device_identity(self):
         from clean_my_agent import portable
         from types import SimpleNamespace

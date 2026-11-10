@@ -472,7 +472,17 @@ def run(args):
     return int(bool(errors))
 
 
+def configure_output():
+    # Frozen Python does not honor PYTHONUTF8. Pipes on Windows otherwise inherit
+    # the system code page, which may not represent the Chinese CLI messages.
+    if os.name == 'nt':
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, 'reconfigure'):
+                stream.reconfigure(encoding='utf-8', errors='backslashreplace')
+
+
 def main(argv=None):
+    configure_output()
     argv = sys.argv[1:] if argv is None else argv
     cli = parser()
     # Keep the existing global --plain before an explicit subcommand valid.
