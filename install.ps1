@@ -78,9 +78,17 @@ try {
     $pending = Join-Path $InstallDir ('.install-' + [Guid]::NewGuid().ToString('N') + '.exe')
     Copy-Item $candidate $pending
     # PowerShell can coerce $null to an empty string for this .NET argument.
-    # Use a real backup path; the verified replacement is atomic and the scratch
-    # directory (including this previous executable) is removed below.
-    if (Test-Path $target) { [IO.File]::Replace($pending, $target, (Join-Path $scratch 'previous.exe')) } else { [IO.File]::Move($pending, $target) }
+    # ReplaceFile requires the backup and both executables on the same volume.
+    if (Test-Path $target) {
+        $backup = Join-Path $InstallDir ('.previous-' + [Guid]::NewGuid().ToString('N') + '.exe')
+        try {
+            [IO.File]::Replace($pending, $target, $backup)
+        } catch {
+            if (!(Test-Path $target) -and (Test-Path $backup)) { [IO.File]::Move($backup, $target) }
+            throw
+        }
+        if (Test-Path $backup) { Remove-Item -LiteralPath $backup -Force }
+    } else { [IO.File]::Move($pending, $target) }
     Set-Content $marker $target -Encoding UTF8
     if (!$NoPath) {
         if (!($entries | Where-Object { $_.TrimEnd('\') -ieq $InstallDir.TrimEnd('\') })) {
