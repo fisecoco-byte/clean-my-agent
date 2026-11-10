@@ -123,7 +123,17 @@ fn link_route_inner(path: &Path, relaxed: bool) -> Result<(PathBuf, Vec<PathBuf>
                         | std::io::ErrorKind::InvalidInput
                 ) => {}
             Err(e) if relaxed && e.kind() == std::io::ErrorKind::PermissionDenied => (),
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // Windows reports ordinary files with a native error that is
+                // not mapped to InvalidInput like Unix's EINVAL.
+                #[cfg(windows)]
+                if e.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_NOT_A_REPARSE_POINT as i32)
+                {
+                    continue;
+                }
+                return Err(e.into());
+            }
         }
     }
     Ok((current, hops))
