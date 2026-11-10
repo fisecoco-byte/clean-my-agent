@@ -8,6 +8,19 @@ use std::{
 };
 
 #[test]
+fn canonical_drive_paths_support_directory_and_metadata_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let path = root.join("metadata.json");
+    fs::write(&path, "fixture").unwrap();
+    assert_eq!(fsutil::resolve(&root).unwrap(), root);
+    assert_eq!(fsutil::resolve(&path).unwrap(), path);
+    let directory = fsutil::Directory::open(&root).unwrap();
+    assert!(directory.info().unwrap().directory());
+    assert_eq!(fsutil::regular_text(&path, 100).unwrap(), "fixture");
+}
+
+#[test]
 fn allocated_bytes_deduplicate_hardlinks_and_skip_junctions() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("scan");

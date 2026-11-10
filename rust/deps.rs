@@ -153,14 +153,14 @@ pub fn check_mounts(path: &Path) -> Result<()> {
             let mut decoded = Vec::new();
             let mut i = 0;
             while i < field.len() {
-                if field[i] == b'\\' && i + 3 < field.len() {
-                    if let Ok(n) =
+                if field[i] == b'\\'
+                    && i + 3 < field.len()
+                    && let Ok(n) =
                         u8::from_str_radix(&String::from_utf8_lossy(&field[i + 1..i + 4]), 8)
-                    {
-                        decoded.push(n);
-                        i += 4;
-                        continue;
-                    }
+                {
+                    decoded.push(n);
+                    i += 4;
+                    continue;
                 }
                 decoded.push(field[i]);
                 i += 1;

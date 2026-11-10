@@ -92,6 +92,15 @@ fn link_route_inner(path: &Path, relaxed: bool) -> Result<(PathBuf, Vec<PathBuf>
             continue;
         }
         current.push(&part);
+        // A drive/UNC prefix is not a filesystem entry. In particular, probing
+        // a verbatim drive prefix (\\?\C:) as a reparse point fails on Windows.
+        // Continue checking every directory/file component after the root.
+        if current
+            .components()
+            .all(|part| matches!(part, Component::Prefix(_) | Component::RootDir))
+        {
+            continue;
+        }
         match fs::read_link(&current) {
             Ok(target) => {
                 hops.push(current.clone());
@@ -147,6 +156,8 @@ mod platform {
     fn name(path: &OsStr) -> Result<CString> {
         Ok(CString::new(path.as_bytes())?)
     }
+    // libc uses different widths for these fields on macOS and Linux.
+    #[allow(clippy::unnecessary_cast)]
     fn info(s: libc::stat) -> Info {
         Info {
             dev: s.st_dev as u64,
