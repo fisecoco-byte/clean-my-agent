@@ -1,11 +1,14 @@
 include clean-my-agent
 include scripts/install-agent.sh
 include install.sh install.ps1
+include README.md README_CN.md
+include assets/logo.png assets/readme-logo.png
 recursive-include scripts *.py
 include scripts/build-linux-container.sh
 recursive-include .github *.yml
 recursive-include skills *.md *.yaml
-recursive-include docs *.md *.png *.svg
+recursive-include docs *.md *.png *.svg *.gif
 include dev/capture-ui.py
+include dev/capture-readme.py
 recursive-include dev/pie *.mjs *.json *-LICENSE
 prune dev/pie/node_modules

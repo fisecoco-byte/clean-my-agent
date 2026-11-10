@@ -181,12 +181,15 @@ def scan(roots, selected, policy, *, full=False, progress=None):
 
 
 def dependencies(root, *, full=True, only=None, progress=None):
-    from .project_types import SWIFT_OUTPUTS, target
+    from .project_types import INDICATORS, SWIFT_OUTPUTS, target
     errors, rows, projects = [], [], []
+    repositories, manifests = set(), set()
     for area in ('worktrees', '.chatgpt-projects', 'projects'):
         for parent, dirs, names, _ in walk(root / area, errors):
             if '.git' in dirs or '.git' in names:
-                projects.append(dict(path=str(parent), directory_bytes=None, artifacts=0))
+                repositories.add(parent)
+            if any(name in INDICATORS or name.endswith(('.csproj', '.fsproj', '.vbproj')) for name in names):
+                manifests.add(parent)
             found = [parent/name for name in dirs if target(parent/name)]
             dirs[:] = [d for d in dirs if d != '.git' and parent/d not in found]
             for build in list(found):
@@ -207,6 +210,9 @@ def dependencies(root, *, full=True, only=None, progress=None):
                                  installation=None, runtime=None, **sizes))
     if only is not None and not rows:
         raise ValueError('请选择盘点返回的项目产物绝对路径')
+    workspaces = repositories | {p for p in manifests if not any(r == p or r in p.parents for r in repositories)}
+    projects = [dict(path=str(p), directory_bytes=None, artifacts=0) for p in sorted(workspaces)
+                if p in repositories or not any(r != p and r in p.parents for r in workspaces)]
     for project in projects:
         path = Path(project['path'])
         project['artifacts'] = sum(path in Path(row['path']).parents for row in rows)

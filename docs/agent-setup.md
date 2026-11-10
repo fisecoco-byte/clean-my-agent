@@ -23,7 +23,7 @@ claude mcp add --scope user clean-my-agent -- clean-my-agent mcp
 
 把本项目放到一个长期保留的目录，打开有本机终端权限的 Agent，把下面的话发给它：
 
-> 在我提供的 Clean My Agent 源码目录检查 Python 和当前客户端。为正在使用的客户端运行 scripts/install-agent.sh codex 或 scripts/install-agent.sh claude，安装用户级只读 MCP 和 Skill。保留同名已有配置。安装后验证能列出工具，并真实调用 get_policy；如果当前会话还未加载，告诉我如何重新打开验证。不要执行清理。
+> 在我提供的 Clean My Agent 源码目录检查 Rust 工具链和当前客户端。为正在使用的客户端运行 scripts/install-agent.sh codex 或 scripts/install-agent.sh claude，安装用户级只读 MCP 和 Skill。保留同名已有配置。安装后验证能列出工具，并真实调用 get_policy；如果当前会话还未加载，告诉我如何重新打开验证。不要执行清理。
 
 若拿到的是源码包，先在希望保留工具的位置解压并进入目录（已在源码目录可跳过）：
 
@@ -32,21 +32,21 @@ tar -xzf /实际路径/clean_my_agent-0.3.1.tar.gz
 cd clean_my_agent-0.3.1
 ```
 
-需要 macOS/Linux、Python 3.10+（含 venv）、对应的 `codex` 或 `claude` CLI。首次安装 Python 依赖需要能访问包源；以后运行不依赖远程 MCP 服务。在**本项目根目录**任选一条：
+需要 macOS/Linux、Rust 工具链、对应的 `codex` 或 `claude` CLI。首次构建需要能访问 crates.io；以后运行不依赖远程 MCP 服务。在**本项目根目录**任选一条：
 
 ```sh
 ./scripts/install-agent.sh codex
 ./scripts/install-agent.sh claude
 ```
 
-脚本可从含空格的路径运行。首次创建虚拟环境时可用 `CMA_PYTHON=python3.11 ./scripts/install-agent.sh codex` 选择 Python。它安装本项目到 `.venv`，然后注册绝对路径的 `.venv/bin/clean-my-agent-mcp`，并建立 Skill 的符号链接：
+脚本可从含空格的路径运行。它使用 Cargo 构建 Rust 可执行文件，再注册绝对路径的 `target/release/clean-my-agent mcp`，并建立 Skill 的符号链接：
 
 | 客户端 | MCP 注册范围 | Skill 位置 |
 | --- | --- | --- |
 | Codex | 当前用户的 Codex 配置 | `~/.agents/skills/clean-my-agent` |
 | Claude Code | `--scope user` | `${CLAUDE_CONFIG_DIR:-~/.claude}/skills/clean-my-agent` |
 
-重复安装会保留已有的同名 MCP（包括原权限）；遇到同名且不是本工具链接的 Skill 会停止。新装默认只读；若脚本提示已有配置，请核对启动命令和参数。**保留源码目录及 .venv**，移动后应重新注册路径。
+重复安装会保留已有的同名 MCP（包括原权限）；遇到同名且不是本工具链接的 Skill 会停止。新装默认只读；若脚本提示已有配置，请核对启动命令和参数。**保留源码目录及 target/release 中的可执行文件**，移动后应重新注册路径。
 
 ## 验证连接并开始使用
 
@@ -93,26 +93,25 @@ cd clean_my_agent-0.3.1
 不使用脚本时，在项目根目录安装并定位可执行文件：
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[mcp]'
-server="$(pwd -P)/.venv/bin/clean-my-agent-mcp"
+cargo build --release --locked
+server="$(pwd -P)/target/release/clean-my-agent"
 ```
 
 按当前客户端选一条注册命令，再把项目中的 `skills/clean-my-agent` 链接到上表的 Skill 位置。不要覆盖其他同名 Skill。
 
 ```sh
-codex mcp add clean-my-agent -- "$server"
-claude mcp add --scope user --transport stdio clean-my-agent -- "$server"
+codex mcp add clean-my-agent -- "$server" mcp
+claude mcp add --scope user --transport stdio clean-my-agent -- "$server" mcp
 ```
 
-若在全新注册时就要开放暂存，在所选命令的 `"$server"` 后加 `--allow-stage`。切换现有配置时，先核对是自己的该项，再用下节命令移除 MCP 注册并重新添加；不必移除 Skill。其他支持 stdio 的客户端可使用以下片段（替换为本机真实绝对路径，配置键以客户端为准）：
+若在全新注册时就要开放暂存，在所选命令的 `"$server" mcp` 后加 `--allow-stage`。切换现有配置时，先核对是自己的该项，再用下节命令移除 MCP 注册并重新添加；不必移除 Skill。其他支持 stdio 的客户端可使用以下片段（替换为本机真实绝对路径，配置键以客户端为准）：
 
 ```json
 {
   "mcpServers": {
     "clean-my-agent": {
-      "command": "/absolute/path/to/clean-my-agent/.venv/bin/clean-my-agent-mcp",
-      "args": []
+      "command": "/absolute/path/to/clean-my-agent/target/release/clean-my-agent",
+      "args": ["mcp"]
     }
   }
 }
@@ -132,4 +131,4 @@ claude mcp remove --scope user clean-my-agent
 
 再移除安装脚本建立的 Skill **链接**。例如 Codex 可用 `test -L "$HOME/.agents/skills/clean-my-agent" && unlink "$HOME/.agents/skills/clean-my-agent"`；Claude Code 对 `"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/clean-my-agent"` 执行相同操作。移除接入不会动数据目录或任何暂存批次。
 
-参考：[MCP 官方 Python SDK](https://github.com/modelcontextprotocol/python-sdk)、[Codex Skills 的发现位置](https://developers.openai.com/codex/skills/)、[Claude Code 的 MCP 注册范围](https://code.claude.com/docs/en/mcp)、[Claude Code Skills](https://code.claude.com/docs/en/skills)。
+参考：[MCP 官方 Rust SDK](https://github.com/modelcontextprotocol/rust-sdk)、[Codex Skills 的发现位置](https://developers.openai.com/codex/skills/)、[Claude Code 的 MCP 注册范围](https://code.claude.com/docs/en/mcp)、[Claude Code Skills](https://code.claude.com/docs/en/skills)。

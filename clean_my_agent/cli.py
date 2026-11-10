@@ -328,6 +328,15 @@ def run(args):
             raise ValueError('请先用 deps 查看候选，再指定一个产物绝对路径')
         path = Path(args.path).expanduser() if args.path else None
         selected = ('codex', 'claude', 't3') if args.agent == 'all' else (args.agent,)
+        if path is None and not args.json and not args.table:
+            data = dependency_report.empty_report(False)
+            def load_dependencies(progress, preview):
+                policy.require_current()
+                return dependency_report.inspect_agents(roots, policy, agents=selected, progress=progress, on_preview=preview)
+            if storage_view.browse(ui, data, actions=None if args.dry_run else DependencyActions(roots, state, policy),
+                                   loader=load_dependencies):
+                warn(data['errors'])
+                return int(bool(data['errors']))
         with ui.working('逐项核实依赖的共享空间和工作树引用') as progress:
             data = dependency_report.inspect_agents(roots, policy, agents=selected, only=path, progress=progress)
         if not args.json:

@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 
 from .policy import DAY_NS
-from .progress import counted
 from .dependency_safety import require_idle
 from . import project_types
 
@@ -156,6 +155,7 @@ class References:
         self.by_path = defaultdict(set)
         repos = set()
         self.repositories = repos
+        self.workspaces = set()
         def fail(exc):
             self.errors.append(str(exc))
         if root.resolve() != root:
@@ -163,6 +163,7 @@ class References:
             return
         if progress:
             progress('查找工作树' if nested else '查找依赖目录')
+        visited = 0
         for area in AREAS:
             start = root / area
             try:
@@ -179,7 +180,12 @@ class References:
                 parent = Path(base)
                 if '.git' in dirs or '.git' in files:
                     repos.add(parent)
+                if any(name in project_types.INDICATORS or name.endswith(('.csproj', '.fsproj', '.vbproj')) for name in files):
+                    self.workspaces.add(parent)
                 for name in dirs + files:
+                    visited += 1
+                    if progress and visited % 2048 == 0:
+                        progress('查找工作树' if nested else '查找依赖目录', detail=f'{visited:,} 项')
                     path = parent / name
                     if name != '.git' and (name in project_types.TARGETS or (name in dirs and project_types.tagged(path))):
                         self.paths.add(path)
@@ -214,12 +220,14 @@ class References:
                 live.append(str(directory))
             # Native find prunes installs before descending; -P also leaves all
             # other symlinks alone. NUL framing preserves arbitrary path names.
-            # One checkout per update in an interactive scan. For unattended
-            # runs keep the original batched find invocation.
+            # Batch interactive scans too; progress counts completed checkouts.
             live.sort()
-            batch_size = 1 if progress else 64
+            batch_size = 64
             batches = [live[i:i+batch_size] for i in range(0, len(live), batch_size)]
-            for batch in counted(batches, progress, '复核工作树引用', lambda b: '/'.join(Path(b[0]).parts[-2:])):
+            completed = 0
+            if progress and live:
+                progress('复核工作树引用', 0, len(live))
+            for batch in batches:
                 names = []
                 for name in sorted(project_types.TARGETS):
                     if names: names.append('-o')
@@ -230,6 +238,9 @@ class References:
                 sources.update(Path(os.fsdecode(p)) for p in result.stdout.split(b'\0') if p)
                 if result.returncode:
                     self.errors.append('子项目引用检查不完整：' + os.fsdecode(result.stderr[:1500]))
+                completed += len(batch)
+                if progress:
+                    progress('复核工作树引用', completed, len(live))
         if progress:
             progress('核对依赖链接')
         for path in sorted(sources):

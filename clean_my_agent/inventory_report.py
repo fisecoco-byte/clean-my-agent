@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from .inventory import BUCKETS, SECTIONS, plan
+from .activity import badge
 from .pie import pie_lines, share
 from .policy import SESSION_DAYS
 from .session_titles import UNTITLED
@@ -36,7 +37,7 @@ def display(ui, doc, details):
                 print(f"  {action}复核 · {group['count']} 个，显示 {len(group['entries'])} 个")
                 for row in group['entries']:
                     print('    ' + (row['title'] or UNTITLED))
-                    print(f"    ID {row['session_id']}  ·  {row['idle_days']} 天  ·  {fmt(row['bytes'])}")
+                    print(f"    ID {row['session_id']}  ·  活跃度 {badge(row)}  ·  {fmt(row['bytes'])}")
         if details:
             for name, g in data['groups'].items():
                 ui.section(f"{SECTIONS[name]} · {g['count']} 项")
@@ -114,7 +115,7 @@ footer{margin-top:22px}#warning{color:#99461c}code{overflow-wrap:anywhere}
 <article><div class="cardhead"><h2>未活跃天数分布 · 会话数占比</h2><small id="volume"></small></div><div class="chart"><div id="pie" class="pie" aria-hidden="true"></div><div id="legend"></div></div><small id="basis"></small></article>
 <article><h2>复核清单</h2><div class="control"><label>归档阈值 <select id="archive"></select></label><label>删除阈值 <select id="delete"></select></label></div>
 <p id="rule"></p><p id="warning"></p>
-<table><thead><tr><th>建议</th><th>标题 / 摘要 · 会话 ID</th><th>未活跃</th></tr></thead><tbody id="rows"></tbody></table>
+<table><thead><tr><th>建议</th><th>标题 / 摘要 · 会话 ID</th><th>活跃度 / 未活跃</th></tr></thead><tbody id="rows"></tbody></table>
 <small id="caption"></small></article><footer id="guide"></footer>
 </main>
 <script type="application/json" id="payload">@@PAYLOAD@@</script>
@@ -144,7 +145,7 @@ function draw(){const v=doc.agents[key], [a,d]=chosen[key], p=v.plans[a+'/'+d];
  el('warning').textContent=v.partial?'盘点不完整，已暂停此 agent 的建议。':'';
  el('rows').replaceChildren();let shown=0;for(const [k,label] of [['archive','归档复核'],['delete','删除复核']]){
  for(const r of p[k].entries){shown++;const tr=node('tr',''),c=node('td',r.title||'（无标题或摘要）');c.className='session';
- c.append(node('code',r.session_id));tr.append(node('td',label),c,node('td',r.idle_days+' 天'));el('rows').append(tr)}}
+ c.append(node('code',r.session_id));tr.append(node('td',label),c,node('td',(r.activity?.label||'未知')+' · '+r.idle_days+' 天'));el('rows').append(tr)}}
  el('caption').textContent=(shown?'共 '+(p.archive.count+p.delete.count)+' 个候选，显示 '+shown+' 个；每类最多 '+doc.limit+' 个。':'当前阈值没有复核候选。')+' 排除复核 '+v.held+' 个。';
  el('guide').textContent=key==='codex'?'手动管理：codex archive <SESSION_ID>  /  codex delete <SESSION_ID>（永久删除）。工作树由 Codex 桌面端管理。':'可用 claude --resume <SESSION_ID> 核对会话。此报告不调用 Claude、不删除文件。';}
 draw();

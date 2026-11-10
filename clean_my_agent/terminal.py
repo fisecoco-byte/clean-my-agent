@@ -9,6 +9,7 @@ import unicodedata
 
 from .policy import REASONS
 from .scan import LABELS
+from ._loading_frames import SCAN_FRAMES
 
 
 def fmt(n):
@@ -58,7 +59,7 @@ def progress_line(width, elapsed, tick, label, done, total, detail):
         prefix = clock + '  '
     else:
         meter = ''
-        frame = '·' if tick is None else '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'[tick % 10]
+        frame = '·' if tick is None else SCAN_FRAMES[tick % len(SCAN_FRAMES)]
         prefix = f'{clock}  {frame}  '
     line = prefix + clipped(label, width - cells(prefix + meter)) + meter
     room = width - cells(line) - 3

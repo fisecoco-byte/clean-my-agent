@@ -48,6 +48,11 @@ class WorktreeActions(unittest.TestCase):
         p=path or self.path
         return dict(path=str(p),agent=agent,directory_bytes=8192,artifacts=0,stamp=fingerprint(p.lstat()))
 
+    def standalone(self):
+        path=self.roots['codex']/'worktrees/standalone'
+        self.git(self.main,'clone','-q',str(self.main),str(path))
+        return path
+
     def inspect(self):
         return self.actions.worktree_details(self.row(),lambda *a,**kw:None)
 
@@ -169,3 +174,108 @@ class WorktreeActions(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.actions.delete_worktree(dict(self.row(self.main),can_delete=True,token='fake'),lambda *a,**kw:None)
         self.assertTrue(self.main.exists())
+
+    @patch('clean_my_agent.system_trash.available',return_value=True)
+    def test_standalone_trash_preserves_repository_and_never_uses_native_remove(self,available):
+        path=self.standalone()
+        preview=self.actions.worktree_details(self.row(path),None)
+        self.assertTrue(preview['can_trash'],preview['reasons'])
+        self.assertFalse(preview['can_delete'])
+        self.assertIsNone(preview['native_command'])
+        with self.assertRaises(ValueError):
+            self.actions.delete_worktree(preview,None)
+        destination=self.home/'trash/standalone'; destination.parent.mkdir()
+        with patch.object(worktrees.system_trash,'move',side_effect=lambda p:p.rename(destination)) as move:
+            with patch.object(worktrees,'git',wraps=worktrees.git) as commands:
+                result=self.actions.trash_repository(preview,None)
+        self.assertEqual(result['status'],'succeeded',result)
+        self.assertEqual(result['trash_path'],str(destination))
+        self.assertTrue((destination/'.git/HEAD').is_file())
+        self.assertTrue((destination/'Cargo.toml').is_file())
+        self.assertFalse(path.exists())
+        self.assertFalse(any('remove' in c.args for c in commands.call_args_list))
+        move.assert_called_once_with(path)
+        destination.rename(path)
+        self.assertTrue(self.actions.worktree_details(self.row(path),None)['can_trash'])
+
+    @patch('clean_my_agent.system_trash.available',return_value=True)
+    def test_standalone_changes_processes_and_shared_objects_are_retained(self,available):
+        path=self.standalone()
+        for filename in ('Cargo.toml','notes.txt','.env'):
+            with self.subTest(filename=filename):
+                file=path/filename; old=file.read_text() if file.exists() else None
+                file.write_text('local data')
+                result=self.actions.worktree_details(self.row(path),None)
+                self.assertFalse(result['can_trash'],result)
+                if old is None:file.unlink()
+                else:file.write_text(old)
+        for state in ('busy','unknown'):
+            snapshot=Idle(); snapshot.check=lambda *a,**kw:dict(state=state,reason='in use')
+            with patch.object(worktrees,'ProcessSnapshot',return_value=snapshot):
+                self.assertFalse(self.actions.worktree_details(self.row(path),None)['can_trash'])
+        other=self.roots['claude']/'worktrees/shared'
+        self.git(path,'clone','-q','--shared',str(path),str(other))
+        result=self.actions.worktree_details(self.row(path),None)
+        self.assertFalse(result['can_trash'],result)
+        self.assertIn(str(other),result['referenced_by'])
+
+    @patch('clean_my_agent.system_trash.available',return_value=True)
+    def test_standalone_new_worktree_or_metadata_change_blocks_confirmation(self,available):
+        path=self.standalone()
+        preview=self.actions.worktree_details(self.row(path),None)
+        self.assertTrue(preview['can_trash'],preview['reasons'])
+        self.git(path,'tag','new-local-tag')
+        with patch.object(worktrees.system_trash,'move') as move:
+            with self.assertRaisesRegex(ValueError,'状态已变化'):
+                self.actions.trash_repository(preview,None)
+            move.assert_not_called()
+        preview=self.actions.worktree_details(self.row(path),None)
+        extra=self.home/'attached'
+        self.git(path,'worktree','add','-q','--detach',str(extra))
+        with patch.object(worktrees.system_trash,'move') as move:
+            with self.assertRaisesRegex(ValueError,'其他附加工作树'):
+                self.actions.trash_repository(preview,None)
+            move.assert_not_called()
+        self.assertTrue(path.exists()); self.assertTrue(extra.exists())
+
+    @patch('clean_my_agent.system_trash.available',return_value=True)
+    def test_standalone_reference_scope_and_action_mismatch_block_trash(self,available):
+        path=self.standalone()
+        preview=self.actions.worktree_details(self.row(path),None)
+        self.assertTrue(preview['can_trash'],preview['reasons'])
+        other=self.roots['claude']/'worktrees/other'; other.mkdir(parents=True)
+        self.git(other,'init','-q')
+        (other/'shared').symlink_to(path)
+        with patch.object(worktrees.system_trash,'move') as move:
+            with self.assertRaisesRegex(ValueError,'引用'):
+                self.actions.trash_repository(preview,None)
+            with self.assertRaises(ValueError):
+                self.actions.trash_repository(dict(self.row(self.main),can_trash=True,token='fake'),None)
+            linked=self.inspect(); linked['can_trash']=True
+            with self.assertRaises(ValueError):
+                self.actions.trash_repository(linked,None)
+            move.assert_not_called()
+
+    @patch('clean_my_agent.system_trash.available',return_value=True)
+    def test_standalone_trash_failure_and_uncertain_result_never_force_delete(self,available):
+        path=self.standalone()
+        preview=self.actions.worktree_details(self.row(path),None)
+        with patch.object(worktrees.system_trash,'move',side_effect=OSError('fixture refused')):
+            result=self.actions.trash_repository(preview,None)
+        self.assertEqual(result['status'],'failed'); self.assertTrue(path.exists())
+        destination=self.home/'moved'
+        def uncertain(p):
+            p.rename(destination)
+            raise subprocess.TimeoutExpired('fixture',120)
+        with patch.object(worktrees.system_trash,'move',side_effect=uncertain):
+            result=self.actions.trash_repository(preview,None)
+        self.assertEqual(result['status'],'uncertain')
+        self.assertTrue((destination/'.git/HEAD').exists())
+
+    def test_standalone_trash_unsupported_platform_is_explicit(self):
+        path=self.standalone()
+        with patch('clean_my_agent.system_trash.available',return_value=False):
+            result=self.actions.worktree_details(self.row(path),None)
+        self.assertFalse(result['can_trash'])
+        self.assertFalse(result['can_delete'])
+        self.assertIn('仅支持 macOS',str(result['reasons']))

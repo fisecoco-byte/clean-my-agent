@@ -63,6 +63,7 @@ SHARED_CSS += """
 class ManagedApp(App):
     operation_busy = False
     return_to_dashboard = False
+    cache_invalidated = False
 
     def on_ready(self):
         if self.return_to_dashboard and self.query('#brand'):
@@ -111,11 +112,13 @@ class ActionScreen(ModalScreen):
                 Binding('enter', 'submit', '确认', priority=True),
                 ('left', 'choose_cancel', '取消'), ('right', 'choose_execute', '确认')]
 
-    def __init__(self, title, body, execute, complete, *, phrase=None, refresh=None, auto_run=False):
+    def __init__(self, title, body, execute, complete, *, phrase=None, refresh=None, auto_run=False,
+                 confirmation_action='永久删除'):
         super().__init__()
         self.heading, self.body = title, body
         self.execute, self.complete, self.refresh_callback = execute, complete, refresh
         self.phrase, self.auto_run = phrase, auto_run
+        self.confirmation_action = confirmation_action
         self.busy = self.finished = False
 
     def compose(self):
@@ -126,7 +129,7 @@ class ActionScreen(ModalScreen):
             yield Static('', id='operation_progress', markup=False)
             yield ProgressBar(show_eta=False, id='jobbar')
             if self.phrase:
-                yield Input(placeholder=f'输入 {self.phrase} 确认永久删除', id='confirmation')
+                yield Input(placeholder=f'输入 {self.phrase} 确认{self.confirmation_action}', id='confirmation')
             with Horizontal(id='dialogkeys'):
                 yield Button('取消', id='cancel', compact=True)
                 yield Button('确认执行', id='execute', compact=True, disabled=bool(self.phrase))
@@ -186,6 +189,9 @@ class ActionScreen(ModalScreen):
 
     def start(self):
         self.busy = self.app.operation_busy = True
+        if not self.auto_run:
+            # Even a failed write can leave an uncertain filesystem outcome.
+            self.app.cache_invalidated = True
         self.query_one('#execute', Button).disabled = True
         self.query_one('#cancel', Button).disabled = True
         for widget in self.query('#confirmation'):

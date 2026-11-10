@@ -1,5 +1,8 @@
 """Textual dependency browser with explicitly confirmed quarantine actions."""
 from pathlib import Path
+from concurrent.futures import CancelledError
+from datetime import datetime
+from threading import Event
 from rich.text import Text
 from textual import on, events
 from textual.app import ComposeResult
@@ -7,9 +10,11 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Input, Static
 
 from .scan import LABELS
+from . import activity
 from .storage_view import GROUPS, LABEL, exact, groups, ordered, project, release, size, row_label
 from .terminal import pad, safe
 from .tui_common import ActionScreen, DetailScreen, ManagedApp, SHARED_CSS
+from .loading_tui import ScanLoading
 
 MINT, AMBER, SOFT = '#7de2bf', '#efc480', '#9ab4ac'
 
@@ -28,6 +33,8 @@ def details(row, *, compact=False):
         if row.get('rebuild'):
             field('重建方式', safe(row['rebuild']))
     if not link:
+        if row.get('activity'):
+            field('所属工作目录活跃度', activity.badge(row) if compact else safe(activity.describe(row)))
         field('预计释放 · 单独永久删除', release(row) if compact else (
             exact(row,'reclaimable_bytes') if row['reclaimable_bytes'] is not None else
             (f"{row['reclaimable_min_bytes']:,} 至 {row['reclaimable_max_bytes']:,} B"
@@ -87,31 +94,64 @@ class StorageApp(ManagedApp):
     ENABLE_COMMAND_PALETTE = False
     BINDINGS = [('q','quit','退出'), ('1','group(0)','候选'), ('2','group(1)','保留'),
                 ('3','group(2)','链接'), ('slash','search','筛选'), ('escape','reset','返回'),
-                ('s','sort','排序'), ('space','toggle','勾选'), ('ctrl+a','select_all','全选'), ('t','stage','暂存清单'), ('v','vault','暂存区'), ('w','worktrees','工作树'), ('0','overview','概览'), ('4','resources','资源'), ('question_mark','help','帮助')]
+                ('s','sort','排序'), ('r','reload','刷新'), ('space','toggle','勾选'), ('a','select_all','全选'), ('ctrl+a','select_all','全选'), ('t','stage','暂存清单'), ('v','vault','暂存区'), ('w','worktrees','工作树'), ('0','overview','概览'), ('4','resources','资源'), ('question_mark','help','帮助')]
 
     CSS = SHARED_CSS + '''
         #storage-actions { height: 1; }
-        #vault { height: 1; width: auto; min-width: 0; border: none; padding: 0 1; margin-left: 2; }
+        #storage-actions Button { min-width: 0; }
+        #scan-status { height: auto; max-height: 2; color: #9ab4ac; }
+        #storage-loading { display: none; }
+        .discovering #worktrees, .discovering #context, .discovering #tabs,
+        .discovering #search, .discovering #warning, .discovering #layout,
+        .discovering #legend, .discovering #storage-actions { display: none; }
+        #reload { height: 1; width: auto; min-width: 0; border: none; padding: 0 1; margin-left: 1; }
+        #selection-tools { height: 1; margin-bottom: 1; }
+        #selection-tools #sortline { width: 1fr; margin-bottom: 0; }
+        #select-all { height: 1; width: 12; min-width: 0; text-wrap: nowrap; border: none; padding: 0 1; margin-left: 1; background: #233234; color: #b3c5bf; }
+        #select-all:disabled { color: #738c83; }
+        #vault { height: 1; width: auto; min-width: 0; border: none; padding: 0 1; margin-left: 1; }
+        .short #heading, .short #context, .short #legend { display: none; }
+        .short #selection-tools { margin-bottom: 0; }
     '''
-    def __init__(self, report, *, scan=None, source=None, actions=None, start_worktrees=False):
+    def __init__(self, report, *, scan=None, source=None, actions=None, start_worktrees=False,
+                 loader=None, load_on_mount=True):
         super().__init__()
         self.report, self.scan_doc, self.source = report, scan, source
         self.buckets = groups(report)
         self.category = next((k for k in GROUPS if self.buckets[k]), 'candidate')
         self.by_size, self.filter_text = False, ''
+        self.sort_mode = 0
         self.rows = []
         self.actions = actions if not source else None
         self.operation_results = []
         self.checked = set()
         self.worktree_scope = None
         self.start_worktrees = start_worktrees
+        self.loader = loader if not source else None
+        self.load_on_mount = load_on_mount
+        self.scan_pending = False
+        self.scan_complete = report['mode'] == 'measured'
+        self.scan_message = ''
+        self._scan_progress = ('正在查找工作目录', None, None, '')
+        self._scan_cancel = Event()
+        self._opened_worktrees = False
+
+    @property
+    def inspection_ready(self):
+        return not self.scan_pending and self.scan_complete
+
+    @property
+    def discovering(self):
+        return self.scan_pending and not (self.report['entries'] or self.report.get('projects'))
 
     def compose(self) -> ComposeResult:
         yield Static('窗口太小，请调整到至少 44 列 × 16 行。q 退出', id='too-small')
         yield Static('CLEAN MY AGENT    /    STORAGE', id='brand')
         yield Static(self.report.get('title', '工作树 / 产物'), id='heading')
-        if self.report.get('projects'):
-            yield Button(f'w 工作树 {len(self.report["projects"])}', id='worktrees', compact=True)
+        if self.loader or self.report.get('projects'):
+            yield Button(f'w 工作树 {len(self.report.get("projects", []))}', id='worktrees', compact=True)
+        yield Static('', id='scan-status', markup=False)
+        yield ScanLoading('正在查找工作目录', id='storage-loading')
         yield Static(id='context', markup=False)
         with Horizontal(id='tabs'):
             for i, group in enumerate(GROUPS, 1):
@@ -124,7 +164,9 @@ class StorageApp(ManagedApp):
         yield Static(id='warning', markup=False)
         with Horizontal(id='layout'):
             with Vertical(id='listpane'):
-                yield Static(id='sortline')
+                with Horizontal(id='selection-tools'):
+                    yield Static(id='sortline')
+                    yield Button('a 全选', id='select-all', compact=True, disabled=True)
                 yield Static(id='empty')
                 yield DataTable(cursor_type='row', id='grid', show_row_labels=False)
             with VerticalScroll(id='side'):
@@ -134,6 +176,8 @@ class StorageApp(ManagedApp):
         with Horizontal(id='storage-actions'):
             yield Button('t 暂存清单', id='stage', compact=True, disabled=True)
             yield Button('v 暂存区', id='vault', compact=True, disabled=self.actions is None)
+            if self.loader:
+                yield Button('r 刷新', id='reload', compact=True)
         yield Static(id='footer')
 
     def on_mount(self):
@@ -149,8 +193,120 @@ class StorageApp(ManagedApp):
         self.query_one('#context').display = bool(ctx)
         self.refresh_list()
         self.query_one(DataTable).focus()
+        if self.loader and self.load_on_mount:
+            self.action_reload()
+        else:
+            self.show_scan_status()
         if self.start_worktrees and self.report.get("projects"):
+            self._opened_worktrees = True
             self.call_after_refresh(self.action_worktrees)
+
+    def on_unmount(self):
+        self._scan_cancel.set()
+
+    @on(Button.Pressed, '#reload')
+    def action_reload(self, *, from_worktrees=False):
+        from .worktree_tui import WorktreeScreen
+        allowed_screen = self.screen is self.screen_stack[0] or (from_worktrees and isinstance(self.screen, WorktreeScreen))
+        if not self.loader or self.scan_pending or self.operation_busy or not allowed_screen:
+            return
+        self.scan_pending, self.scan_complete = True, False
+        self.checked.clear()
+        self._scan_cancel = Event()
+        self._scan_progress = ('正在查找工作目录', None, None, '')
+        self.scan_message = ('正在查找工作目录' if self.discovering else '正在刷新 · 当前显示上次记录')
+        self.show_scan_status()
+        self.refresh_list(True)
+        self.run_worker(self.load_report, thread=True, exit_on_error=False)
+
+    def load_report(self):
+        cancelled = self._scan_cancel
+        def send(callback, *args):
+            if cancelled.is_set():
+                raise CancelledError()
+            try:
+                self.call_from_thread(callback, *args)
+            except RuntimeError as exc:
+                if cancelled.is_set() or not self.is_running:
+                    raise CancelledError() from exc
+                raise
+        def progress(label, done=None, total=None, detail=''):
+            send(self.scan_progress, label, done, total, detail)
+        try:
+            report = self.loader(progress, lambda data: send(self.received_report, data, False))
+            send(self.received_report, report, True)
+        except CancelledError:
+            return
+        except Exception as exc:
+            if not cancelled.is_set():
+                try:
+                    send(self.scan_failed, str(exc))
+                except CancelledError:
+                    pass
+
+    def scan_progress(self, label, done, total, detail):
+        self._scan_progress = (label, done, total, detail)
+        count = f' {done}/{total}' if type(done) is int and type(total) is int and total > 0 else ''
+        prefix = '正在扫描' if self.discovering else '后台测量'
+        self.scan_message = f'{prefix} · {safe(label)}{count}' + (' · '+safe(detail) if detail else '')
+        self.show_scan_status()
+
+    def show_scan_status(self):
+        base = self.screen_stack[0]
+        base.set_class(self.discovering, 'discovering')
+        loading = base.query_one('#storage-loading', ScanLoading)
+        if self.discovering:
+            if loading.started is None:
+                loading.start()
+            loading.set_progress(*self._scan_progress)
+        elif loading.started is not None:
+            loading.stop()
+        message = self.scan_message
+        if not message and self.report.get('measured_at'):
+            message = '采集于 '+self.report['measured_at'].replace('T',' ')+' · r 刷新'
+        self.screen_stack[0].query_one('#scan-status', Static).update(message)
+        self.screen_stack[0].query_one('#scan-status').display = bool(message)
+        self.query_one('#vault', Button).disabled = self.actions is None or not self.inspection_ready
+        if self.query('#reload'):
+            self.query_one('#reload', Button).disabled = self.scan_pending
+        if self.query('#worktrees'):
+            self.query_one('#worktrees', Button).disabled = not self.report.get('projects')
+        from .worktree_tui import WorktreeScreen
+        for screen in self.screen_stack:
+            if isinstance(screen, WorktreeScreen) and screen.is_mounted:
+                screen.show_status()
+
+    def received_report(self, report, complete):
+        index = self.screen_stack[0].query_one('#grid', DataTable).cursor_row
+        selected = self.rows[index]['path'] if 0 <= index < len(self.rows) else None
+        self.report.clear()
+        self.report.update(report)
+        if complete:
+            self.scan_pending, self.scan_complete = False, True
+            self.report['measured_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+            self.scan_message = ''
+        self.update_worktree_data()
+        if selected:
+            self.category = next((key for key in GROUPS if any(r['path'] == selected for r in self.buckets[key])), self.category)
+        errors = self.report['errors']
+        self.query_one('#warning', Static).display = bool(errors)
+        self.query_one('#warning', Static).update(f'盘点不完整 · {len(errors)} 条提示 [?]')
+        self.refresh_list(True)
+        from .worktree_tui import WorktreeScreen
+        for screen in self.screen_stack:
+            if isinstance(screen, WorktreeScreen) and screen.is_mounted:
+                screen.replace_report()
+        self.show_scan_status()
+        if self.start_worktrees and not self._opened_worktrees and self.report.get('projects'):
+            self._opened_worktrees = True
+            self.call_after_refresh(self.action_worktrees)
+
+    def scan_failed(self, message):
+        self.scan_pending, self.scan_complete = False, False
+        self.scan_message = '测量未完成：'+safe(message)+' · r 重试'
+        self.report['errors'].append(message)
+        self.show_scan_status()
+        self.refresh_list(True)
 
     def on_resize(self, event: events.Resize):
         base = self.screen_stack[0]
@@ -166,7 +322,11 @@ class StorageApp(ManagedApp):
             return
         table = self.query_one(DataTable)
         index = table.cursor_row if preserve else 0
-        self.rows = ordered(self.buckets[self.category], self.category, self.by_size, self.filter_text)
+        selected = self.rows[index]['path'] if preserve and 0 <= index < len(self.rows) else None
+        self.rows = ordered(self.buckets[self.category], self.category, self.by_size, self.filter_text,
+                            activity_order={2:'cold',3:'hot'}.get(self.sort_mode))
+        if selected:
+            index = next((i for i,r in enumerate(self.rows) if r['path'] == selected), 0)
         for group in GROUPS:
             self.query_one('#'+group, Button).set_class(group==self.category, 'chosen')
             count = (sum(len(r['sources']) for r in self.buckets[group]) if group == 'links' else len(self.buckets[group]))
@@ -176,13 +336,13 @@ class StorageApp(ManagedApp):
         link = self.category=='links'
         cols = ([('目标项目',0),('链接',5),('引用',5)] if link else
                 [('项目 / 资源',0),('预计释放',13), *([('目录大小',11)] if width>=53 else []),
-                 *([('共享占用',11)] if width>=70 else [])])
+                 *([('共享占用',11)] if width>=70 else []), *([('活跃度',12)] if width>=88 else [])])
         cols[0] = (cols[0][0], max(9, width - sum(w for _,w in cols) - len(cols)*2 - 1))
         for j,(label,w) in enumerate(cols):
             table.add_column(Text(pad(label,w,True) if j else label), width=w)
         for i, row in enumerate(self.rows):
             nums = ([str(len(row['sources'])),str(len(row['referenced_by']))] if link else
-                    [release(row),size(row['directory_bytes']),size(row['shared_bytes'])])
+                    [release(row),size(row['directory_bytes']),size(row['shared_bytes']),activity.badge(row)])
             mark = ('☑ ' if row['path'] in self.checked else '☐ ') if self.actions is not None and hasattr(self.actions,'stage_many') and row.get('status')=='candidate' else ''
             table.add_row(Text(mark+row_label(row),no_wrap=True,overflow='ellipsis'),
                           *[Text(pad('范围 · 详情' if j==0 and not link and '–' in n and len(n)>cols[1][1] else n,
@@ -193,13 +353,19 @@ class StorageApp(ManagedApp):
         table.move_cursor(row=idx)
         self.preview(idx)
         empty = self.query_one('#empty', Static)
-        empty.display = not self.rows
-        empty.update('无匹配项 · Esc 清除' if self.filter_text else '暂无记录')
-        sort = ('同一目标的链接合并显示' if link else '按目录大小 ↓' if self.by_size else '按预计释放 ↓（范围取下限）')
-        self.query_one('#sortline', Static).update(Text(f'{len(self.rows)} 项  ·  已选 {len(self.checked)}  ·  {sort}'))
+        empty.display = not self.rows and not self.discovering
+        empty.update('正在扫描…' if self.scan_pending else '扫描未完整完成 · ? 查看原因' if self.report['errors'] else
+                     '无匹配项 · Esc 清除' if self.filter_text else '暂无记录')
+        sort = ('同一目标的链接合并显示' if link else
+                ('按预计释放 ↓（范围取下限）','按目录大小 ↓','活跃度 ↑','活跃度 ↓')[self.sort_mode])
+        line = f'{len(self.rows)} 项 · 已选 {len(self.checked)}'
+        if width >= 70:
+            line += ' · ' + sort
+        self.query_one('#sortline', Static).update(Text(line, no_wrap=True, overflow='ellipsis'))
         self.query_one('#footer', Static).update(
+            '正在查找工作目录 · q '+('返回' if self.return_to_dashboard else '退出') if self.discovering else
             'Space 勾选 · Enter 详情 · / 搜索 · '+('s 排序 · ' if self.size.width>=74 else '')+
-            ('0 概览 · 4 资源 · ' if self.scan_doc else '')+'? 帮助 · '+
+            ('0 概览 · 4 资源 · ' if self.scan_doc else '')+('r 刷新 · ' if self.loader else '')+'? 帮助 · '+
             ('q 返回' if self.return_to_dashboard else 'q 退出'))
 
     def preview(self, idx):
@@ -207,17 +373,21 @@ class StorageApp(ManagedApp):
         widget.update(details(self.rows[idx],compact=True) if 0<=idx<len(self.rows) else '无选中项')
         self.query_one('#side',VerticalScroll).scroll_home(animate=False)
         self.query_one('#stage', Button).disabled = not (self.checked or self.can_stage(idx))
+        paths = self.selectable_paths()
+        button = self.query_one('#select-all', Button)
+        button.disabled = not paths or self.operation_busy
+        button.label = 'a 取消全选' if paths and paths <= self.checked else 'a 全选'
 
     @on(Button.Pressed, '#vault')
     def action_vault(self):
-        if self.screen is not self.screen_stack[0] or self.operation_busy or self.actions is None:
+        if self.screen is not self.screen_stack[0] or self.operation_busy or self.actions is None or not self.inspection_ready:
             return
         from .vault_tui import VaultScreen
         self.push_screen(VaultScreen(self.actions.quarantine()))
 
     @on(Button.Pressed, '#worktrees')
     def action_worktrees(self):
-        if self.operation_busy or self.screen is not self.screen_stack[0]:
+        if self.operation_busy or self.screen is not self.screen_stack[0] or not self.report.get('projects'):
             return
         from .worktree_tui import WorktreeScreen
         actions = self.actions if self.actions is not None and hasattr(self.actions,'worktree_details') else None
@@ -253,21 +423,30 @@ class StorageApp(ManagedApp):
             self.checked.symmetric_difference_update({path})
             self.refresh_list(True)
 
+    def selectable_paths(self):
+        if self.actions is None or not hasattr(self.actions, 'stage_many'):
+            return set()
+        return {r['path'] for i,r in enumerate(self.rows) if self.can_stage(i)}
+
+    @on(Button.Pressed, '#select-all')
     def action_select_all(self):
-        if self.screen is not self.screen_stack[0] or not self.actions or not hasattr(self.actions,'stage_many'):
+        if self.screen is not self.screen_stack[0] or self.operation_busy:
             return
-        paths = {r['path'] for i,r in enumerate(self.rows) if self.can_stage(i)}
-        self.checked = set() if self.checked==paths else paths
+        paths = self.selectable_paths()
+        if not paths:
+            return
+        self.checked = set() if paths <= self.checked else paths
         self.refresh_list(True)
+        self.query_one(DataTable).focus()
 
     def can_stage(self, idx):
-        return (self.actions is not None and not self.report['errors']
+        return (self.inspection_ready and self.actions is not None and not self.report['errors']
                 and not (self.scan_doc and self.scan_doc['errors']) and 0 <= idx < len(self.rows)
                 and self.rows[idx]['kind'] in ('directory', 'file') and self.rows[idx]['status'] == 'candidate')
 
     @on(Button.Pressed, '#stage')
     def action_stage(self):
-        if self.screen is not self.screen_stack[0] or self.operation_busy:
+        if self.screen is not self.screen_stack[0] or self.operation_busy or not self.inspection_ready:
             return
         idx = self.query_one(DataTable).cursor_row
         if not self.checked and not self.can_stage(idx):
@@ -326,6 +505,8 @@ class StorageApp(ManagedApp):
             self.action_group(GROUPS.index(event.button.id))
 
     def action_group(self, index):
+        if self.discovering:
+            return
         self.checked.clear()
         self.category=GROUPS[index]
         self.refresh_list()
@@ -333,10 +514,13 @@ class StorageApp(ManagedApp):
 
     def action_sort(self):
         if self.category!='links':
-            self.by_size=not self.by_size
-            self.refresh_list()
+            self.sort_mode = (self.sort_mode+1) % 4
+            self.by_size = self.sort_mode == 1
+            self.refresh_list(True)
 
     def action_search(self):
+        if self.discovering:
+            return
         search=self.query_one(Input)
         search.add_class('open')
         search.focus()
@@ -372,10 +556,11 @@ class StorageApp(ManagedApp):
 
     def action_help(self):
         t=Text('1 / 2 / 3   候选、保留、软链接\n↑ / ↓       选择项目\nEnter       完整路径、精确字节和引用来源\n'
-               '/           按工作树、项目或引用路径筛选\nEsc         清除筛选或返回\ns           切换预计释放 / 目录大小排序\n'
-               + ('0           查看扫描分类和最大目录\n4           Agent 额外资源与扩展版本（只读）\n' if self.scan_doc else '') + 'w           工作树列表、详情与删除\nSpace       勾选产物；Ctrl+A 选择当前候选\nt           暂存清单，Enter 确认\nv           暂存区：Space 勾选，d 删除 / r 恢复\nq           返回 / 退出\n\n历史快照只读；暂存入口仅对实时报告中的候选开放。\n'
+               '/           按工作树、项目或引用路径筛选\nEsc         清除筛选或返回\ns           预计释放 / 目录大小 / 活跃度升序 / 降序\n'
+               + ('0           查看扫描分类和最大目录\n4           Agent 额外资源与扩展版本（只读）\n' if self.scan_doc else '') + 'w           工作树列表、详情与删除\nSpace       勾选产物\na / Ctrl+A  全选或取消当前筛选下的全部候选（含滚动区域）\nt           暂存清单，Enter 确认\nv           暂存区：Space 勾选，d 删除 / r 恢复\nq           返回 / 退出\n\n历史快照只读；暂存入口仅对实时报告中的候选开放。\n'
                '预计释放按单个目录永久删除计算，各行不可相加。暂存释放 0 B。\n'
-               '安装和运行检查见 Enter 详情；暂存前会重新核实目录与引用。')
+               '安装和运行检查见 Enter 详情；暂存前会重新核实目录与引用。\n'
+               'r 刷新盘点；后台测量时可浏览，完成前不开放清理。\n' + activity.LEGEND)
         for e in self.scan_doc['errors'] if self.scan_doc else self.report['errors']:
             t.append('\n'+safe(e), style=AMBER)
         self.open_detail(DetailScreen('帮助', t))

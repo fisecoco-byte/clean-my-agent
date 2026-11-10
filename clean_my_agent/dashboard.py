@@ -1,5 +1,6 @@
 """Unified entry point. Inventory on entry; all writes require a reviewed action."""
 from datetime import datetime
+from copy import deepcopy
 import os
 from pathlib import Path
 import sys
@@ -14,11 +15,13 @@ class DashboardService:
         self.roots, self.state = layout()
         self.agent, self.profile, self.days, self.full = agent, profile, days, full
         self.policy = policies.load(profile, days)
+        self.dependency_reports = {}
 
     def selected(self, agent):
         return {'codex', 'claude', 't3'} if agent == 'all' else {agent}
 
     def snapshot(self, progress=None):
+        self.dependency_reports.clear()
         self.policy = policies.load(self.profile, self.days)
         result = scan(self.roots, self.selected(self.agent), self.policy, full=self.full, progress=progress)
         groups = [dict(agent=a, category=c, bytes=r[1], eligible_files=r[2], eligible_bytes=r[3])
@@ -35,6 +38,13 @@ class DashboardService:
                     bytes_scope=('Windows 文件分配量，不含文件系统元数据；共享与释放未知；当前仅盘点' if os.name == 'nt' else
                                  '已选 Agent 主目录计块；额外目录另列，不把重叠或共享空间重复相加'),
                     measured_at=datetime.now().astimezone().isoformat(timespec='seconds'))
+
+    def dependency_loader(self, agent):
+        def load(progress, preview):
+            self.policy.require_current()
+            return dependency_report.inspect_agents(self.roots, self.policy,
+                agents=sorted(self.selected(agent)), progress=progress, on_preview=preview)
+        return load
 
     def clean_preview(self, agent, progress=None):
         self.policy.require_current()
@@ -111,9 +121,10 @@ def browse(ui, *, agent='all', profile=None, days=None, full=True):
         notices = []
         try:
             if route == 'deps':
-                data = load_page('核对项目产物', lambda p: dependency_report.inspect_agents(
-                    service.roots, service.policy, agents=sorted(service.selected(selected)), progress=p))
-                page = StorageApp(data, actions=DependencyActions(service.roots, service.state, service.policy), start_worktrees=True)
+                cached = service.dependency_reports.get(selected)
+                data = deepcopy(cached) if cached is not None else dependency_report.empty_report(False)
+                page = StorageApp(data, actions=DependencyActions(service.roots, service.state, service.policy),
+                                  start_worktrees=True, loader=service.dependency_loader(selected), load_on_mount=cached is None)
             elif route == 'sessions':
                 data, rows = load_page('读取会话与标题', lambda p: inventory.inspect(
                     service.roots, service.policy, agent=selected, progress=p))
@@ -139,9 +150,16 @@ def browse(ui, *, agent='all', profile=None, days=None, full=True):
             page.return_to_dashboard = True
             page.run()
             notices = list(page.operation_results)
-            if notices:
+            changed = bool(notices) or getattr(page, 'cache_invalidated', False) is True
+            if route == 'deps':
+                if page.scan_complete and not changed and not page.report['errors']:
+                    service.dependency_reports[selected] = deepcopy(page.report)
+                else:
+                    service.dependency_reports.pop(selected, None)
+            if changed:
                 # Never return stale totals after a mutation or an uncertain result.
                 snapshot = None
+                service.dependency_reports.clear()
         except (OSError, ValueError, RuntimeError) as exc:
             notices = ['未完成：' + str(exc)]
     return True

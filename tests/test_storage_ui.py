@@ -93,8 +93,7 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
             try:
                 fcntl.ioctl(s,termios.TIOCSWINSZ,struct.pack('HHHH',28,110,0,0))
                 prior=termios.tcgetattr(s)
-                cmd=Path(__file__).resolve().parents[1]/'clean-my-agent'
-                proc=subprocess.Popen([sys.executable,cmd,'deps','--from-report',source],env=env,
+                proc=subprocess.Popen([sys.executable,'-m','clean_my_agent','deps','--from-report',source],env=env,
                                       stdin=s,stdout=s,stderr=s)
                 try:
                     data=b''

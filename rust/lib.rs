@@ -1,0 +1,24 @@
+pub mod actions;
+pub mod activity;
+pub mod dashboard;
+pub mod dependency_report;
+pub mod deps;
+pub mod extensions;
+pub mod fsops;
+pub mod fsutil;
+pub mod inventory;
+pub mod policy;
+pub mod process;
+pub mod progress;
+pub mod project_types;
+pub mod resources;
+pub mod scan;
+pub mod storage;
+pub mod terminal;
+pub mod tui;
+pub mod vault;
+pub mod worktrees;
+
+pub mod mcp;
+pub mod reports;
+pub mod ui_actions;

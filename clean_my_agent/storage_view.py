@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 from .terminal import cells, fmt, pad, safe
+from . import activity
 
 GROUPS = ('candidate', 'retained', 'links')
 LABEL = {'candidate': '候选', 'retained': '保留', 'links': '链接'}
@@ -72,8 +73,10 @@ def groups(report):
     return result
 
 
-def ordered(rows, group, by_size=False, query=''):
+def ordered(rows, group, by_size=False, query='', activity_order=None):
     def rank(r):
+        if activity_order and group != 'links':
+            return activity.sort_key(r, activity_order)
         if group == 'links':
             n = len(r['sources'])
         elif by_size:
@@ -176,15 +179,15 @@ def summary(ui, report):
     ui.note('单项预计释放不可相加；暂存释放 0 B。--plain 可打印完整路径和引用。')
 
 
-def browse(ui, data, *, scan=None, source=None, actions=None):
+def browse(ui, data, *, scan=None, source=None, actions=None, loader=None):
     if not (ui.active and sys.stdin.isatty() and os.environ.get('TERM') not in ('', 'dumb')
-            and data['mode'] == 'measured' and (data['entries'] or data.get('projects'))):
+            and (loader or (data['mode'] == 'measured' and (data['entries'] or data.get('projects'))))):
         return False
     try:
         from .storage_tui import StorageApp
     except ImportError:
         return False
-    app = StorageApp(data, scan=scan, source=source, actions=actions)
+    app = StorageApp(data, scan=scan, source=source, actions=actions, loader=loader)
     selected = app.run()
     for result in app.operation_results:
         for line in result.splitlines():

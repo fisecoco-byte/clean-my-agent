@@ -1,4 +1,4 @@
-"""Exercise the frozen executable against an isolated home on every release OS."""
+"""Exercise the Rust executable against an isolated home on every release OS."""
 import argparse
 import json
 import os
@@ -32,30 +32,37 @@ with tempfile.TemporaryDirectory() as temp:
         return subprocess.run([str(exe),*argv],cwd=base,env=env,capture_output=True,encoding='utf-8',timeout=90)
     for argv in [('--version',),('--help',),('mcp','--help')]:
         result=run(*argv)
-        assert result.returncode==0,result.stderr
+        assert result.returncode==0,(argv,result.returncode,result.stderr,result.stdout)
     result=run('dashboard','--agent','codex','--json')
-    assert result.returncode==0,result.stderr
+    assert result.returncode==0,(result.returncode,result.stderr,result.stdout)
     data=json.loads(result.stdout)
     assert data['bytes']>0 and not data['errors'],data
     result=run('inventory','--agent','codex','--json')
-    assert result.returncode==0,result.stderr
+    assert result.returncode==0,(result.returncode,result.stderr,result.stdout)
     inventory=json.loads(result.stdout)
     assert not inventory['errors']
     assert inventory['agents']['codex']['session_count']==1
+    assert inventory['agents']['codex']['activity_levels']['high']==1
     artifact=codex/'worktrees/rust-demo/target'
     artifact.mkdir(parents=True)
     (artifact/'fixture').write_bytes(b'x'*4096)
+    manifest=artifact.parent/'Cargo.toml'
+    manifest.write_text('[package]\nname="release-fixture"\nversion="0.1.0"\n',encoding='utf-8')
+    os.utime(manifest,(1,1))
     result=run('deps','--agent','codex','--json')
-    assert result.returncode==0,result.stderr
-    assert json.loads(result.stdout)['entries'][0]['artifact']=='target'
+    assert result.returncode==0,(result.returncode,result.stderr,result.stdout)
+    dependencies=json.loads(result.stdout)
+    assert dependencies['entries'][0]['artifact']=='target'
+    assert dependencies['projects'][0]['activity']['level']=='very_low'
+    assert dependencies['entries'][0]['activity']['workspace']==str(artifact.parent)
     cache=base/'home/.cache/opencode'
     cache.mkdir(parents=True)
     (cache/'fixture').write_text('cache')
     result=run('resources','--agent','opencode','--quick','--json')
-    assert result.returncode==0,result.stderr
+    assert result.returncode==0,(result.returncode,result.stderr,result.stdout)
     assert json.loads(result.stdout)['entries'][0]['can_stage'] is False
     if os.name=='nt':
         result=run('clean','--apply')
         assert result.returncode!=0
     assert fixture.exists() and not (base/'state').exists()
-print('Frozen release smoke checks passed.')
+print('Rust release smoke checks passed.')

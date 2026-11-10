@@ -12,7 +12,8 @@ from unittest.mock import patch
 from clean_my_agent import policy, vault
 from clean_my_agent.scan import layout, scan, fingerprint, disk_bytes
 
-CLI = Path(__file__).resolve().parents[1] / 'clean-my-agent'
+# Exercise the retained Python baseline; the root launcher now starts Rust.
+CLI = [sys.executable, '-m', 'clean_my_agent']
 
 
 class Workflow(unittest.TestCase):
@@ -26,7 +27,7 @@ class Workflow(unittest.TestCase):
         self.st = self.home / 'state/clean-my-agent'
 
     def cli(self, *args, ok=True):
-        p = subprocess.run([sys.executable, str(CLI), *args], capture_output=True, text=True, env=self.env)
+        p = subprocess.run([*CLI, *args], capture_output=True, text=True, env=self.env)
         self.assertEqual(p.returncode == 0, ok, (p.stdout, p.stderr))
         return p.stdout
 

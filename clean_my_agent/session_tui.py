@@ -6,6 +6,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Input, Static
 
 from .inventory import SECTIONS, plan
+from . import activity
 from .pie import pie_lines
 from .policy import SESSION_DAYS
 from .session_titles import UNTITLED
@@ -22,7 +23,7 @@ def session_detail(row, agent, *, compact=False):
     if compact:
         t.append(safe(row['title'] or UNTITLED)+'\n\n', style='bold')
         t.append(row['session_id']+'\n\n', style=SOFT)
-        t.append(f'{STATE[row["state"]]} · {row["idle_days"]} 天未活跃\n{size(row["bytes"])}')
+        t.append(f'{STATE[row["state"]]} · {row["idle_days"]} 天未活跃\n{size(row["bytes"])}\n\n活跃度 {activity.badge(row)}')
         if row.get('hold_reason'):
             t.append('\n\n'+safe(row['hold_reason']), style=AMBER)
         return t
@@ -31,6 +32,7 @@ def session_detail(row, agent, *, compact=False):
                          ('未活跃', str(row['idle_days']) + ' 天'), ('会话占用', size(row['bytes']))]:
         t.append(label + '\n', style=SOFT)
         t.append(safe(value) + '\n\n')
+    t.append('活跃度\n' + safe(activity.describe(row)) + '\n\n')
     if row.get('hold_reason'):
         t.append('保留原因\n' + safe(row['hold_reason']), style=AMBER)
     elif agent == 'claude':
@@ -45,7 +47,7 @@ class SessionApp(ManagedApp):
                 ('a',"mode('archive')",'归档'), ('d',"mode('delete')",'删除'), ('v',"mode('all')",'全部'),
                 ('space','toggle','勾选'), ('ctrl+a','select_visible','勾选筛选结果'), ('x','review','操作清单'),
                 ('slash','search','搜索'), ('escape','reset','清除'), ('r','reload','刷新'),
-                ('i','overview','分布'), ('question_mark','help','帮助')]
+                ('i','overview','分布'), ('s','sort','排序'), ('question_mark','help','帮助')]
     CSS = SHARED_CSS + """
     #modes, #thresholds, #actions { height: auto; }
     #modes Button, #thresholds Button, #actions Button {
@@ -68,6 +70,7 @@ class SessionApp(ManagedApp):
         self.rows = []
         self.operation_results = []
         self.show_details = details
+        self.sort_mode = 'cold'
 
     def compose(self) -> ComposeResult:
         yield Static('窗口太小，请调整到至少 44 列 × 16 行。q 退出', id='too-small')
@@ -97,6 +100,7 @@ class SessionApp(ManagedApp):
             yield Button('x 操作清单', id='review', compact=True, disabled=True)
             yield Button('r 刷新', id='reload', compact=True)
             yield Button('i 活跃分布', id='distribution', compact=True)
+            yield Button('s 排序', id='sort', compact=True)
         yield Static('Space 勾选 · Enter 详情 · / 搜索 · ? 帮助 · '+
                      ('q 返回' if self.return_to_dashboard else 'q 退出'), id='footer')
 
@@ -128,10 +132,15 @@ class SessionApp(ManagedApp):
             return
         table = self.query_one(DataTable)
         index = table.cursor_row if preserve else 0
+        selected = self.rows[index]['session_id'] if preserve and 0 <= index < len(self.rows) else None
         plans = self.plans()
         rows = self.all_rows[self.agent_key] if self.mode == 'all' else plans[self.mode]['entries']
         words = self.filter_text.casefold().split()
         self.rows = [r for r in rows if all(w in ((r['title'] or '') + ' ' + r['session_id']).casefold() for w in words)]
+        self.rows.sort(key=(lambda r: (-r['bytes'], r['session_id'])) if self.sort_mode == 'size'
+                       else lambda r: activity.sort_key(r, self.sort_mode))
+        if selected:
+            index = next((i for i,r in enumerate(self.rows) if r['session_id'] == selected), 0)
         for key in self.doc['agents']:
             self.query_one('#'+key, Button).set_class(key == self.agent_key, 'chosen')
         for mode in ('archive','delete','all'):
@@ -149,11 +158,11 @@ class SessionApp(ManagedApp):
         warning.update('盘点不完整 · 操作暂停 [?]' if errors else 'Windows · 只读' if readonly else 'Claude Code · 只读')
         table.clear(columns=True)
         width = max(20, self.size.width - (41 if self.size.width >= 110 else 6))
-        with_id = width >= 91
+        with_id = width >= 95
         columns = [('选', 3), ('标题 / 摘要', 0)]
         if with_id:
             columns.append(('完整会话 ID', 36))
-        columns.append(('未活跃', 7))
+        columns.append(('活跃度', 12))
         if width >= 45:
             columns.append(('状态', 10))
         columns[1] = (columns[1][0], max(9, width-sum(w for _,w in columns)-len(columns)*2-1))
@@ -164,7 +173,7 @@ class SessionApp(ManagedApp):
             values = [Text(mark, style=MINT), Text(safe(row['title'] or UNTITLED), no_wrap=True, overflow='ellipsis')]
             if with_id:
                 values.append(Text(row['session_id']))
-            values.append(Text(f"{row['idle_days']} 天"))
+            values.append(Text(activity.badge(row), style=activity.COLORS[activity.value(row).get('level','unknown')]))
             if width >= 45:
                 values.append(Text(STATE[row['state']], style=SOFT))
             table.add_row(*values, key=str(n))
@@ -173,7 +182,7 @@ class SessionApp(ManagedApp):
         self.preview(index)
         self.query_one('#empty').display = not self.rows
         self.query_one('#empty', Static).update('无匹配会话')
-        self.query_one('#sortline', Static).update(f'{len(self.rows)} 项 · 已选 {len(self.checked)} · 未活跃天数 ↓')
+        self.query_one('#sortline', Static).update(f'{len(self.rows)} 项 · 已选 {len(self.checked)} · {activity.SORT_LABELS[self.sort_mode]}')
         button = self.query_one('#review', Button)
         button.disabled = not self.checked or self.agent_key != 'codex'
         label = '归档' if self.mode == 'archive' else '永久删除'
@@ -206,6 +215,14 @@ class SessionApp(ManagedApp):
         elif key == 'review': self.action_review()
         elif key == 'reload': self.action_reload()
         elif key == 'distribution': self.action_overview()
+        elif key == 'sort': self.action_sort()
+
+    def action_sort(self):
+        if self.screen is not self.screen_stack[0] or self.operation_busy:
+            return
+        modes = ('cold', 'hot', 'size')
+        self.sort_mode = modes[(modes.index(self.sort_mode)+1) % len(modes)]
+        self.refresh_list(True)
 
     def action_agent(self, key):
         if key in self.doc['agents']:
@@ -312,7 +329,9 @@ class SessionApp(ManagedApp):
 
     def action_overview(self):
         data = self.doc['agents'][self.agent_key]
-        text = Text(f"{NAMES[self.agent_key]} · {data['session_count']} 个会话\n未活跃天数分布\n\n", style='bold')
+        distribution = (' · '.join(f'{activity.LABELS[k]} {v}' for k,v in data['activity_levels'].items())
+                        if data.get('activity_levels') else '未活跃天数分布')
+        text = Text(f"{NAMES[self.agent_key]} · {data['session_count']} 个会话\n{distribution}\n\n", style='bold')
         colors = {'slice0':'cyan','slice1':'green','slice2':'yellow','slice3':'magenta','slice4':'red', 'normal':''}
         for line in pie_lines(data['histogram'], min(78, max(20, self.size.width-12))):
             for content, style in line:
@@ -328,6 +347,7 @@ class SessionApp(ManagedApp):
         text = Text('1 / 2   切换 Codex / Claude Code\na / d / v   待归档 / 待删除 / 全部\n'
                     '点击天数按钮   调整 5 / 10 / 15 / 20 天阈值\n'
                     '空格   勾选当前会话\nCtrl+A   勾选或取消当前筛选结果中的全部候选\n'
+                    's   活跃度升序 / 降序 / 占用排序；勾选保持不变\n' + activity.LEGEND + '\n'
                     'x   查看清单并确认操作\nEnter   查看完整 ID 和标题\n/   搜索标题或 ID\n'
                     'i   活跃分布与文件明细\nr   刷新\nEsc   清除搜索和勾选\nq   返回 / 退出\n\n'
                     '弹窗中 Esc / q 关闭帮助或返回列表。\n'

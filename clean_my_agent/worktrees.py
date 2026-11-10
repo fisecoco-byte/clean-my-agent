@@ -1,4 +1,4 @@
-"""Checked deletion of registered linked worktrees through Git, never rmtree."""
+"""Checked Git worktree removal and recoverable disposal of standalone repositories."""
 from contextlib import closing
 import hashlib
 import json
@@ -9,7 +9,7 @@ import sqlite3
 import stat
 import subprocess
 
-from . import deps, project_types, vault
+from . import deps, project_types, system_trash, vault
 from .dependency_safety import ProcessSnapshot, regular_text
 from .scan import fingerprint
 
@@ -124,10 +124,37 @@ def ignored_artifacts(path, root, progress):
     return entries
 
 
+def object_references(repositories, path):
+    """A shared clone can depend on another repository without a filesystem link."""
+    references = set()
+    for repo in repositories:
+        if contains(path, repo):
+            continue
+        common = git_path(repo, '--git-common-dir')
+        objects = (common/'objects').resolve(strict=True)
+        if contains(path, common) or contains(path, objects):
+            references.add(str(repo))
+        alternates = objects/'info/alternates'
+        if alternates.exists() or alternates.is_symlink():
+            for line in regular_text(alternates)[0].splitlines():
+                if not line:
+                    continue
+                if line.startswith('"'):
+                    raise ValueError('Git 共享对象路径含转义，无法完整核实引用：'+str(repo))
+                target = Path(line)
+                if not target.is_absolute():
+                    target = objects/target
+                if contains(path, target.resolve()):
+                    references.add(str(repo))
+    return references
+
+
 def inspect(roots, state, policy, selected, progress=None):
     path, source = Path(selected['path']), selected['agent']
     result = dict(path=str(path), agent=source, directory_bytes=selected.get('directory_bytes'),
-                  can_delete=False, reasons=[], checks={}, referenced_by=[], ignored=[], changes=[],
+                  activity=selected.get('activity'),
+                  can_delete=False, can_trash=False, repository_kind=None,
+                  reasons=[], checks={}, referenced_by=[], ignored=[], changes=[],
                   native_command=None, token=None)
     if os.name == 'nt':
         result['reasons'].append('Windows 当前只读盘点')
@@ -152,13 +179,23 @@ def inspect(roots, state, policy, selected, progress=None):
         if git_path(path, '--show-toplevel') != path:
             raise ValueError('该路径不是仓库根目录')
         pointer = path/'.git'
-        if pointer.is_symlink() or not pointer.is_file():
-            raise ValueError('主工作区或独立仓库保留；仅删除附加 worktree')
+        if pointer.is_symlink() or not (pointer.is_file() or pointer.is_dir()):
+            raise ValueError('Git 元数据路径异常，保留')
         common, gitdir = git_path(path,'--git-common-dir'), git_path(path,'--git-dir')
-        if gitdir == common or gitdir.parent != common/'worktrees' or contains(path, common):
-            raise ValueError('不是标准附加 worktree，或仓库元数据位于目标内')
-        if path not in registered(path):
-            raise ValueError('Git 未登记此工作树')
+        if pointer.is_dir():
+            result['repository_kind'] = 'standalone'
+            if common != pointer or gitdir != pointer:
+                raise ValueError('仓库依赖外部 Git 元数据，保留')
+            if set(registered(path)) != {path}:
+                raise ValueError('该仓库仍管理其他附加工作树，请先处理这些工作树')
+            if not system_trash.available():
+                raise ValueError('独立仓库移入废纸篓目前仅支持 macOS')
+        else:
+            result['repository_kind'] = 'linked_worktree'
+            if gitdir == common or gitdir.parent != common/'worktrees' or contains(path, common):
+                raise ValueError('不是标准附加 worktree，或仓库元数据位于目标内')
+            if path not in registered(path):
+                raise ValueError('Git 未登记此工作树')
         if (gitdir/'locked').exists() or (gitdir/'locked').is_symlink():
             raise ValueError('Git 工作树已锁定，保留')
         for name in ('index.lock','HEAD.lock','MERGE_HEAD','CHERRY_PICK_HEAD','REVERT_HEAD','rebase-merge','rebase-apply','sequencer','BISECT_START'):
@@ -174,7 +211,8 @@ def inspect(roots, state, policy, selected, progress=None):
         if not preserved:
             raise ValueError('HEAD 提交没有被分支或标签保留；请先保存提交')
         result.update(stamp=fingerprint(info), head=head, branch=branch, common_dir=str(common), git_dir=str(gitdir))
-        result['native_command'] = ['git','-C',str(common),'worktree','remove','--',str(path)]
+        if result['repository_kind'] == 'linked_worktree':
+            result['native_command'] = ['git','-C',str(common),'worktree','remove','--',str(path)]
         return root
     root = check('工作树身份', identity)
     if root is None:
@@ -205,6 +243,8 @@ def inspect(roots, state, policy, selected, progress=None):
             refs.update(str(p) for p in index.incoming(path))
             refs.update(str(p) for p,target in index.targets.items()
                         if contains(target,path) and not contains(path,p))
+            if result['repository_kind'] == 'standalone':
+                refs.update(object_references(index.repositories, path))
         result['referenced_by'] = sorted(refs)
         result['agent_references'] = codex_references(roots['codex'],path)
         if refs or any(r['blocking'] for r in result['agent_references']):
@@ -229,10 +269,33 @@ def inspect(roots, state, policy, selected, progress=None):
     if os.name == 'nt':
         result['reasons'].append('Windows 当前只读盘点')
     if not result['reasons']:
-        proof = [result[k] for k in ('path','agent','stamp','head','branch','common_dir','git_dir')]+[digest]
+        proof = [result[k] for k in ('path','agent','stamp','head','branch','common_dir','git_dir','repository_kind')]+[digest]
         result['token'] = hashlib.sha256(json.dumps(proof,ensure_ascii=True).encode()).hexdigest()
-        result['can_delete'] = True
+        result['can_trash' if result['repository_kind'] == 'standalone' else 'can_delete'] = True
     return result
+
+
+def trash(roots, state, policy, expected, progress=None):
+    if not expected.get('can_trash') or not expected.get('token'):
+        raise ValueError('请先核对一个可移入废纸篓的独立仓库')
+    policy.require_current()
+    current = inspect(roots,state,policy,expected,progress)
+    if not current['can_trash'] or current['token'] != expected['token']:
+        raise ValueError('仓库状态已变化，未移入废纸篓：'+('；'.join(current['reasons']) or '目录或文件有变化'))
+    policy.require_current()
+    path = Path(current['path'])
+    if fingerprint(path.lstat()) != tuple(current['stamp']):
+        raise ValueError('仓库在执行前发生变化，未移入废纸篓')
+    if progress:
+        progress('移入系统废纸篓', detail=str(path))
+    try:
+        destination = system_trash.move(path)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        return dict(status='failed' if os.path.lexists(path) else 'uncertain', path=str(path),
+                    message='移入废纸篓未确认：'+str(exc)+'；请检查原路径和系统废纸篓，不会改为永久删除')
+    return dict(status='succeeded', path=str(path), trash_path=str(destination),
+                message='已移入系统废纸篓，尚未释放空间。\n仓库文件、分支和 Git 历史均保留在：'+str(destination)+
+                        '\n清空废纸篓前，可将整个目录移回原路径：'+str(path))
 
 
 def remove(roots, state, policy, expected, progress=None):

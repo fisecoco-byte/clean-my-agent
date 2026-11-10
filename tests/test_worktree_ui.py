@@ -4,7 +4,7 @@ from pathlib import Path
 from clean_my_agent.storage_tui import StorageApp
 from clean_my_agent.worktree_tui import WorktreeScreen
 from clean_my_agent.tui_common import ActionScreen, DetailScreen
-from textual.widgets import Button, DataTable, Input
+from textual.widgets import Button, DataTable, Input, Static
 from test_storage_ui import fixture
 
 
@@ -91,11 +91,14 @@ class WorktreeUI(unittest.IsolatedAsyncioTestCase):
         controller=Mock(); doc=report()
         app=StorageApp(doc,actions=controller,source='snapshot.json')
         async with app.run_test(size=(44,16)) as pilot:
-            await pilot.press('w','d')
+            await pilot.press('w')
             self.assertIsInstance(app.screen,WorktreeScreen)
             self.assertTrue(app.screen.query_one('#wt-delete',Button).disabled)
+            await pilot.press('d')
+            self.assertIsInstance(app.screen,DetailScreen)
+            self.assertIn('只读查看',app.screen.body.plain)
             controller.worktree_details.assert_not_called()
-            await pilot.press('p','space','t')
+            await pilot.press('escape','p','space','t')
             self.assertFalse(app.checked)
             controller.stage.assert_not_called()
         controller.worktree_details.return_value=dict(doc['projects'][0],can_delete=False,reasons=['未提交改动'])
@@ -105,3 +108,86 @@ class WorktreeUI(unittest.IsolatedAsyncioTestCase):
             await pilot.press('d'); await self.wait_screen(app,pilot,DetailScreen)
             self.assertIn('未提交改动',app.screen.body.plain)
             controller.delete_worktree.assert_not_called()
+
+    async def test_delete_blocker_is_prominent_and_follows_selected_directory(self):
+        doc=report(); controller=Mock()
+        reason='主工作区或独立仓库保留；仅删除附加 worktree'
+        blocked=dict(doc['projects'][0],can_delete=False,reasons=[reason])
+        allowed=dict(doc['projects'][0],can_delete=True,reasons=[],token='fresh-check')
+        controller.worktree_details.side_effect=[blocked,allowed,blocked]
+        app=StorageApp(doc,actions=controller,start_worktrees=True)
+        async with app.run_test(size=(100,28)) as pilot:
+            await self.wait_screen(app,pilot,WorktreeScreen)
+            screen=app.screen
+            await pilot.press('d'); await self.wait_screen(app,pilot,DetailScreen)
+            self.assertIn('当前不能删除',app.screen.heading)
+            body=app.screen.body.plain
+            self.assertLess(body.index(reason),body.index('目录占用'))
+            await pilot.press('escape')
+            self.assertIn(reason,str(screen.query_one('#wt-status',Static).render()))
+            self.assertEqual(str(screen.query_one('#wt-delete',Button).label),'d 原因')
+            await pilot.press('down')
+            self.assertNotIn(reason,str(screen.query_one('#wt-status',Static).render()))
+            self.assertEqual(str(screen.query_one('#wt-delete',Button).label),'d 清理')
+            await pilot.press('up')
+            self.assertIn(reason,str(screen.query_one('#wt-status',Static).render()))
+            await pilot.press('d'); await self.wait_screen(app,pilot,ActionScreen)
+            self.assertEqual(controller.worktree_details.call_count,2)
+            self.assertEqual(app.screen.phrase,'DELETE')
+            controller.delete_worktree.assert_not_called()
+            await pilot.press('escape','d'); await self.wait_screen(app,pilot,DetailScreen)
+            self.assertEqual(controller.worktree_details.call_count,3)
+            controller.delete_worktree.assert_not_called()
+            await pilot.press('escape')
+            screen.replace_report(); await pilot.pause()
+            self.assertNotIn(reason,str(screen.query_one('#wt-status',Static).render()))
+
+    async def test_delete_after_incomplete_scan_explains_retry(self):
+        controller=Mock()
+        app=StorageApp(report(),actions=controller,start_worktrees=True)
+        async with app.run_test(size=(80,24)) as pilot:
+            await self.wait_screen(app,pilot,WorktreeScreen)
+            app.scan_complete=False
+            app.screen.show_status()
+            self.assertTrue(app.screen.query_one('#wt-delete',Button).disabled)
+            await pilot.press('d')
+            self.assertIsInstance(app.screen,DetailScreen)
+            self.assertIn('请按 r 重新扫描',app.screen.body.plain)
+            controller.worktree_details.assert_not_called()
+            controller.delete_worktree.assert_not_called()
+
+    async def test_standalone_repository_uses_trash_confirmation_and_executor(self):
+        doc=report(); controller=Mock()
+        preview=dict(doc['projects'][0],repository_kind='standalone',can_trash=True,can_delete=False,
+                     token='fixture',reasons=[])
+        controller.worktree_details.return_value=preview
+        controller.trash_repository.return_value=dict(status='succeeded',path=preview['path'],
+            trash_path='/demo/.Trash/app',message='已移入系统废纸篓，尚未释放空间')
+        app=StorageApp(doc,actions=controller,start_worktrees=True)
+        async with app.run_test(size=(100,28)) as pilot:
+            await self.wait_screen(app,pilot,WorktreeScreen)
+            screen=app.screen
+            await pilot.press('enter'); await self.wait_screen(app,pilot,DetailScreen)
+            self.assertIn('独立仓库',app.screen.body.plain)
+            await pilot.press('escape')
+            self.assertEqual(str(screen.query_one('#wt-delete',Button).label),'d 废纸篓')
+            await pilot.press('d'); await self.wait_screen(app,pilot,ActionScreen)
+            self.assertEqual(app.screen.heading,'确认移入废纸篓')
+            self.assertEqual(app.screen.phrase,'TRASH')
+            self.assertIn('Git 历史',app.screen.body.plain)
+            self.assertIn('不释放空间',app.screen.body.plain)
+            self.assertIn('移入废纸篓',app.screen.query_one(Input).placeholder)
+            self.assertNotIn('永久删除',app.screen.query_one(Input).placeholder)
+            app.screen.query_one(Input).value='DELETE'; await pilot.pause()
+            self.assertTrue(app.screen.query_one('#execute',Button).disabled)
+            await pilot.press('escape')
+            controller.trash_repository.assert_not_called()
+            await pilot.press('d'); await self.wait_screen(app,pilot,ActionScreen)
+            app.screen.query_one(Input).value='TRASH'; await pilot.pause()
+            action=app.screen; await pilot.press('enter'); await self.finished(app,pilot,action)
+            controller.trash_repository.assert_called_once_with(preview,unittest.mock.ANY)
+            controller.delete_worktree.assert_not_called()
+            self.assertTrue(app.cache_invalidated)
+            await pilot.press('escape')
+            self.assertEqual(screen.query_one(DataTable).row_count,1)
+            self.assertEqual(len(doc['entries']),1)

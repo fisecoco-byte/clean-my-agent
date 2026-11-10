@@ -11,6 +11,69 @@ import struct
 import sys
 
 
+class DirectoryUsage:
+    """Allocated blocks reusable within one scan, deduplicating hard links.
+
+    Keep identities only for multiply linked non-directories, not every file.
+    These summaries are never a cleanup authorization or a persistent cache.
+    """
+    def __init__(self):
+        self.bytes = 0
+        self.links = {}
+
+    def observe(self, info):
+        amount = info.st_blocks * 512
+        if info.st_nlink > 1 and not stat.S_ISDIR(info.st_mode):
+            self.links[(info.st_dev, info.st_ino)] = amount
+        else:
+            self.bytes += amount
+
+    def merge(self, other):
+        self.bytes += other.bytes
+        self.links.update(other.links)
+
+    def total(self):
+        # Match du -k: round once for the entire tree, not per artifact.
+        amount = self.bytes + sum(self.links.values())
+        return ((amount + 1023) // 1024) * 1024
+
+
+def workspace_usage(path, measured, *, progress=None):
+    """Count a workspace, pruning artifacts measured earlier in this report."""
+    from .scan import fingerprint
+    total = DirectoryUsage()
+    root = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    def fail(exc):
+        raise exc
+    try:
+        base = os.fstat(root)
+        total.observe(base)
+        visited = 0
+        for relative, dirs, files, fd in os.fwalk('.', dir_fd=root, follow_symlinks=False, onerror=fail):
+            visited += len(dirs) + len(files)
+            if progress and visited >= 2048:
+                progress('统计工作树完整占用', detail=path.name)
+                visited = 0
+            for name in dirs + files:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if info.st_dev != base.st_dev:
+                    if name in dirs:
+                        dirs.remove(name)
+                    continue
+                child = path / relative / name
+                cached = measured.get(child)
+                if cached and name in dirs and fingerprint(info) == cached[0] and stat.S_ISDIR(info.st_mode):
+                    total.merge(cached[1])
+                    dirs.remove(name)
+                else:
+                    total.observe(info)
+        if not os.path.samestat(base, path.lstat()):
+            raise ValueError('统计期间工作目录已替换')
+    finally:
+        os.close(root)
+    return total.total()
+
+
 class DarwinAttributes:
     # See getattrlist(2), sys/attr.h. The returned bitmap, not field contents,
     # says which attributes the volume actually supplies. Fixed offsets require
@@ -132,11 +195,11 @@ def measure(path, *, on_entries=None, on_entry=None):
                 if on_entry:
                     on_entry(os.path.join(relative, name), s)
                 totals.observe(fd, name, s, attrs)
-            if on_entries:
-                visited += len(dirs) + len(files)
-                if visited - reported >= 2048:
-                    on_entries(visited)
-                    reported = visited
+                if on_entries:
+                    visited += 1
+                    if visited - reported >= 2048:
+                        on_entries(visited)
+                        reported = visited
         if not os.path.samestat(base, os.lstat(path)):
             raise ValueError('测量期间依赖目录已替换')
     finally:

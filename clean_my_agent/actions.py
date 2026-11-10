@@ -24,6 +24,9 @@ class DependencyActions:
     def delete_worktree(self, expected, progress):
         return worktrees.remove(self.roots,self.state,self.policy,expected,progress)
 
+    def trash_repository(self, expected, progress):
+        return worktrees.trash(self.roots,self.state,self.policy,expected,progress)
+
     def stage_many(self, selected, progress):
         if not selected or len({r['path'] for r in selected}) != len(selected):
             raise ValueError('请选择不重复的产物候选')

@@ -16,7 +16,8 @@ import unittest
 from clean_my_agent.report_tui import Report
 from clean_my_agent.inventory import plan
 
-CLI = Path(__file__).resolve().parents[1] / 'clean-my-agent'
+# Exercise the retained Python baseline; the root launcher now starts Rust.
+CLI = [sys.executable, '-m', 'clean_my_agent']
 
 
 class ReporterTests(unittest.TestCase):
@@ -61,7 +62,7 @@ class ReporterTests(unittest.TestCase):
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
             resize(24, 80)
             saved = termios.tcgetattr(slave)
-            p = subprocess.Popen([sys.executable, CLI, 'reporter'], stdin=slave, stdout=slave, stderr=slave, env=env)
+            p = subprocess.Popen([*CLI, 'reporter'], stdin=slave, stdout=slave, stderr=slave, env=env)
             try:
                 def until(marker):
                     buf = b''
@@ -106,7 +107,7 @@ class ReporterTests(unittest.TestCase):
                     p.wait()
             # Pipelines always terminate and the machine format contains no curses output.
             for args in [('reporter','--plain'), ('report','--json'), ('inventory','--tui')]:
-                out = subprocess.check_output([sys.executable, CLI, *args], stdin=subprocess.DEVNULL, env=env, timeout=5)
+                out = subprocess.check_output([*CLI, *args], stdin=subprocess.DEVNULL, env=env, timeout=5)
                 self.assertNotIn(b'\x1b', out)
                 if '--json' in args:
                     self.assertEqual(json.loads(out)['agents']['claude']['session_count'], 1)

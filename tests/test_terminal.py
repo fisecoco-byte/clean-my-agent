@@ -15,7 +15,8 @@ from unittest.mock import patch
 
 from clean_my_agent.terminal import Terminal, cells, progress_line
 
-CLI = Path(__file__).resolve().parents[1] / 'clean-my-agent'
+# Exercise the retained Python baseline; the root launcher now starts Rust.
+CLI = [sys.executable, '-m', 'clean_my_agent']
 
 
 class ScanProgress(unittest.TestCase):
@@ -73,7 +74,7 @@ class TerminalModes(unittest.TestCase):
         read, write = pty.openpty()
         with os.fdopen(read, 'rb', buffering=0) as reader:
             with os.fdopen(write, 'wb', buffering=0) as writer:
-                proc = subprocess.Popen([sys.executable, CLI, *args], env={**self.env, **env},
+                proc = subprocess.Popen([*CLI, *args], env={**self.env, **env},
                                         stdout=writer, stderr=subprocess.PIPE)
             data = bytearray()
             while True:

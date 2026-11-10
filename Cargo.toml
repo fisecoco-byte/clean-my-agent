@@ -1,0 +1,58 @@
+[package]
+name = "clean-my-agent"
+version = "0.4.1"
+edition = "2024"
+description = "Inspect and safely clean local coding agent storage"
+license = "MIT"
+default-run = "clean-my-agent"
+
+[lib]
+path = "rust/lib.rs"
+
+[[bin]]
+name = "clean-my-agent"
+path = "rust/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+libc = "0.2"
+ratatui = "0.30"
+regex = "1"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tempfile = "3"
+unicode-normalization = "0.1"
+unicode-casefold = "0.2"
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+toml = "0.9"
+plist = "1"
+indexmap = "2"
+rmcp = { version = "3", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+
+
+[[test]]
+name = "worktree_actions"
+path = "rust/tests/worktree_actions.rs"
+
+[build-dependencies]
+sha2 = "0.10"
+
+[[test]]
+name = "windows_readonly"
+path = "rust/tests/windows_readonly.rs"

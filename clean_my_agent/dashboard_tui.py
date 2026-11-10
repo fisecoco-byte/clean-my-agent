@@ -1,15 +1,15 @@
 """Home, file cleanup and quarantine pages in the same terminal workflow."""
 from pathlib import Path
-import time
 
 from rich.text import Text
 from textual import on, events
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, DataTable, ProgressBar, Static
+from textual.widgets import Button, DataTable, Static
 
 from .scan import LABELS, agent as agent_of
 from .terminal import NAMES, fmt, safe
 from .tui_common import ActionScreen, DetailScreen, ManagedApp, SHARED_CSS
+from .loading_tui import ScanLoading
 
 MINT, SOFT, AMBER = '#7de2bf', '#9ab4ac', '#efc480'
 
@@ -19,12 +19,27 @@ class LoadingApp(ManagedApp):
     def __init__(self, title, loader):
         super().__init__()
         self.heading, self.loader = title, loader
+    def compose(self):
+        yield Static('CLEAN MY AGENT', id='brand')
+        yield ScanLoading(self.heading)
     def on_mount(self):
-        self.push_screen(ActionScreen(self.heading, Text('正在读取，请稍候…'), self.loader,
-                                     self.completed, auto_run=True))
+        self.operation_busy = True
+        self.query_one(ScanLoading).start()
+        self.run_worker(self.load, thread=True, exit_on_error=False)
+    def load(self):
+        def progress(label, done=None, total=None, detail=''):
+            self.call_from_thread(self.progress, label, done, total, detail)
+        try:
+            result = self.loader(progress)
+        except Exception as exc:
+            result = {'error': str(exc)}
+        self.call_from_thread(self.completed, result)
+    def progress(self, label, done, total, detail):
+        self.query_one(ScanLoading).set_progress(label, done, total, detail)
     def completed(self, result):
+        self.operation_busy = False
+        self.query_one(ScanLoading).stop()
         self.exit(result)
-        return Text('读取完成')
 
 
 def load_page(title, loader):
@@ -42,9 +57,12 @@ class DashboardApp(ManagedApp):
     BINDINGS = [('q','quit','退出'), ('0',"agent('all')",'全部'), ('1',"agent('codex')",'Codex'),
                 ('2',"agent('claude')",'Claude'), ('3',"agent('t3')",'T3'), ('r','reload','刷新'), ('question_mark','help','帮助')]
     CSS = SHARED_CSS + """
+        #heading { margin: 1 0; }
         #tabs Button { min-width: 8; padding: 0 1; margin-right: 1; }
+        .compact-home #tabs Button { min-width: 0; padding: 0; margin-right: 1; }
         #metrics { height: auto; padding: 0 2; border: solid #364a46; margin-bottom: 1; }
-        #home-progress { height: 1; }
+        #home-loading { display: none; }
+        .scanning #metrics, .scanning #home-message, .scanning #layout, .scanning #open { display: none; }
         #open { width: auto; height: 1; border: none; background: #7de2bf; color: #10251e; padding: 0 2; }
         #home-message { height: auto; max-height: 2; color: #9ab4ac; margin-bottom: 1; }
         #home-message.attention { color: #efc480; }
@@ -56,8 +74,6 @@ class DashboardApp(ManagedApp):
         self.agent_key = service.agent if service.agent != 'all' else agent
         self.notices = notices
         self.rows = []
-        self.phase = '准备统计主目录占用'
-        self.started = None
 
     def compose(self):
         yield Static('窗口太小，请调整到至少 44 列 × 16 行。q 退出', id='too-small')
@@ -68,7 +84,7 @@ class DashboardApp(ManagedApp):
                 yield Button(name, id=key, compact=True)
         yield Static('统计中…', id='metrics', markup=False)
         yield Static('', id='home-message', markup=False)
-        yield ProgressBar(show_eta=False, id='home-progress')
+        yield ScanLoading('正在盘点存储', id='home-loading')
         with Horizontal(id='layout'):
             with Vertical(id='listpane'):
                 yield DataTable(cursor_type='row', id='grid', show_row_labels=False)
@@ -76,22 +92,17 @@ class DashboardApp(ManagedApp):
         yield Static('↑↓ 选择 · r 刷新 · ? 帮助 · q 退出', id='footer')
 
     def on_mount(self):
-        self.set_interval(1, self.elapsed)
         if self.snapshot is None:
             self.action_reload()
         else:
             self.fill()
         self.query_one(DataTable).focus()
 
-    def elapsed(self):
-        if self.started is not None:
-            elapsed = int(time.monotonic() - self.started)
-            self.query_one('#home-message', Static).update(f'{elapsed//60:02d}:{elapsed%60:02d} · {self.phase}')
-
     def on_resize(self, event: events.Resize):
         self.screen_stack[0].set_class(event.size.width < 105, 'narrow')
+        self.screen_stack[0].set_class(event.size.width < 60, 'compact-home')
         self.screen_stack[0].set_class(event.size.width < 44 or event.size.height < 16, 'tiny')
-        if self.is_mounted and self.screen is self.screen_stack[0] and self.snapshot:
+        if self.is_mounted and self.screen is self.screen_stack[0] and self.snapshot and not self.operation_busy:
             self.fill()
             if event.size.width >= 44 and event.size.height >= 16:
                 self.call_after_refresh(self.query_one(DataTable).focus)
@@ -100,9 +111,9 @@ class DashboardApp(ManagedApp):
         if self.operation_busy or self.screen is not self.screen_stack[0]:
             return
         self.operation_busy = True
-        self.started = time.monotonic()
+        self.screen_stack[0].add_class('scanning')
         self.query_one('#open', Button).disabled = True
-        self.query_one('#home-progress').display = True
+        self.query_one(ScanLoading).start()
         self.run_worker(self.load, thread=True, exit_on_error=False)
 
     def load(self):
@@ -116,21 +127,20 @@ class DashboardApp(ManagedApp):
             self.call_from_thread(self.loaded, doc)
 
     def progress(self, label, done, total, detail):
-        self.phase = safe(label + (' · '+detail if detail else ''))
-        self.query_one('#home-progress', ProgressBar).update(total=total, progress=done or 0)
-        self.elapsed()
+        self.query_one(ScanLoading).set_progress(label, done, total, detail)
 
     def failed(self, message):
         self.operation_busy = False
-        self.started = None
-        self.query_one('#home-progress').display = False
+        self.screen_stack[0].remove_class('scanning')
+        self.query_one(ScanLoading).stop()
+        if self.snapshot is None:
+            self.query_one('#metrics', Static).update('扫描未完成')
         self.query_one('#home-message').add_class('attention')
         self.query_one('#home-message', Static).update('读取失败：'+safe(message)+' · r 重试，q 退出')
 
     def loaded(self, doc):
         self.snapshot = doc
         self.operation_busy = False
-        self.started = None
         self.fill()
 
     def action_agent(self, key):
@@ -158,7 +168,8 @@ class DashboardApp(ManagedApp):
         for b in self.query('#tabs Button'):
             b.set_class(b.id == self.agent_key, 'chosen')
             b.disabled = self.service.agent != 'all' and b.id != self.service.agent
-        self.query_one('#home-progress').display = False
+        self.screen_stack[0].remove_class('scanning')
+        self.query_one(ScanLoading).stop()
         message = f'采集于 {doc["measured_at"][:19].replace("T"," ")}'
         if doc.get('read_only'):
             message += ' · Windows 只读'

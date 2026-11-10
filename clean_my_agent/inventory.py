@@ -50,7 +50,7 @@ def walk(base, errors):
         errors.append(str(exc))
 
 
-def thread_index(root):
+def thread_index(root, *, workspace_records=None):
     """Read state and optional display names, never message columns."""
     dbs = [(int(m[1]), p) for p in root.glob('state_*.sqlite') if (m := re.fullmatch(r'state_(\d+)\.sqlite', p.name))]
     if not dbs:
@@ -78,12 +78,24 @@ def thread_index(root):
                   'recency_at': 10**9, 'archived_at': 10**9}
         keys = [k for k in clocks if k in cols]
         labels = [f'substr({k},1,4096)' if k in cols else 'NULL' for k in ('name', 'title', 'summary')]
-        fields = ['id', 'archived', 'is_pinned' if 'is_pinned' in cols else '0', *labels, *keys]
+        locations = [f'substr({k},1,8192)' if k in cols else 'NULL' for k in ('cwd', 'rollout_path')]
+        fields = ['id', 'archived', 'is_pinned' if 'is_pinned' in cols else '0', *labels, *locations, *keys]
         result = {}
-        for sid, archived, pinned, name, title, summary, *times in db.execute('select ' + ','.join(fields) + ' from threads'):
+        for sid, archived, pinned, name, title, summary, cwd, rollout, *times in db.execute('select ' + ','.join(fields) + ' from threads'):
             if isinstance(sid, str):
                 latest = max([0] + [int(t * clocks[k]) for k, t in zip(keys, times) if isinstance(t, (int, float))])
                 result[sid.lower()] = (archived, bool(pinned), latest, label(name), label(title) or label(summary))
+                if workspace_records is not None and isinstance(cwd, str) and Path(cwd).is_absolute():
+                    if isinstance(rollout, str):
+                        file = Path(rollout)
+                        if any(base in file.parents for base in (root/'sessions', root/'archived_sessions')):
+                            try:
+                                s = file.lstat()
+                                if stat.S_ISREG(s.st_mode) and file.resolve() == file:
+                                    latest = max(latest, s.st_mtime_ns)
+                            except FileNotFoundError:
+                                pass
+                    workspace_records.append((Path(cwd), latest, 'Codex 会话索引 / 会话文件'))
     if no_wal and (wal.exists() or Path(str(path) + '-journal').exists() or path.stat().st_mtime_ns != before.st_mtime_ns):
         raise ValueError('Codex 索引已更新，请重新盘点')
     return result, 'index+files'
@@ -107,6 +119,7 @@ def plan(rows, archive_days, delete_days, limit):
 
 
 def collect(agent, root, policy, rules, now, full, limit, progress=None):
+    from .activity import classify
     errors = []
     groups = {k: [] for k in (SECTIONS if agent == 'codex' else ('sessions',))}
     sessions = {}
@@ -204,6 +217,10 @@ def collect(agent, root, policy, rules, now, full, limit, progress=None):
             route = None
         rows.append(dict(session_id=sid, title=title or None, idle_days=age, bytes=raw['bytes'], route=route,
                          latest_ns=latest, hold_reason=held,
+                         activity=classify(latest, now_ns=now, complete=not errors,
+                             running=held == '当前运行的会话',
+                             basis='会话索引 / 文件最近修改' if source == 'index+files' else '会话文件 / 子代理文件最近修改',
+                             warning='会话盘点不完整' if errors else '活动时间异常' if latest > now else None),
                          state='unverified' if uncertain else 'unknown' if agent == 'claude' else 'archived' if archived else 'open'))
     rows.sort(key=lambda r: (-r['idle_days'], -r['bytes'], r['session_id']))
     summary = {}
@@ -213,7 +230,10 @@ def collect(agent, root, policy, rules, now, full, limit, progress=None):
         summary[name] = dict(count=len(items), bytes=total, entries=items[:limit])
     return dict(root=str(root), groups=summary, session_count=len(rows), session_bytes=sum(r['bytes'] for r in rows),
                 held=sum(r['route'] is None for r in rows), activity_source=source,
-                histogram=dict(zip(BUCKETS, histogram)), policy=rules, recommendations=plan(rows, **rules, limit=limit),
+                histogram=dict(zip(BUCKETS, histogram)),
+                activity_levels={k: sum(r['activity']['level'] == k for r in rows)
+                                 for k in ('high','medium','low','very_low','unknown')},
+                policy=rules, recommendations=plan(rows, **rules, limit=limit),
                 errors=errors, guidance=MANAGEMENT if agent == 'codex' else {'review': CLAUDE_GUIDE}), rows
 
 

@@ -62,7 +62,7 @@ Unix 自定义 `ZDOTDIR`、`XDG_CONFIG_HOME` 时，安装与卸载应使用相�
 再次运行在线安装命令即更新到最新正式 Release。指定版本：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fisecoco-byte/clean-my-agent/main/install.sh | bash -s -- --version v0.3.1
+curl -fsSL https://raw.githubusercontent.com/fisecoco-byte/clean-my-agent/main/install.sh | bash -s -- --version v0.4.1
 ```
 
 Unix 卸载：
@@ -75,7 +75,7 @@ Windows 先下载脚本，再执行更新参数或卸载：
 
 ```powershell
 irm https://raw.githubusercontent.com/fisecoco-byte/clean-my-agent/main/install.ps1 -OutFile install.ps1
-.\install.ps1 -Version v0.3.1
+.\install.ps1 -Version v0.4.1
 # 卸载时运行：
 .\install.ps1 -Uninstall
 ```
@@ -93,13 +93,13 @@ Windows 原生包提供总览、会话 ID / 标题、资源与扩展版本、依
 仓库上传到 `fisecoco-byte/clean-my-agent` 后：
 
 1. 保留 `.github/workflows/release.yml`，启用 Actions。
-2. 在 `clean_my_agent/__init__.py` 设置版本号；打包元数据自动读取同一版本。
+2. 在 `Cargo.toml` 设置版本号；程序、打包元数据和发布标签使用同一版本。
    同时添加对应的 `docs/releases/vX.Y.Z.md` 发布说明。
 3. 推送与版本一致的标签，例如：
 
    ```sh
-   git tag v0.3.1
-   git push origin v0.3.1
+   git tag v0.4.1
+   git push origin v0.4.1
    ```
 
 4. Actions 在五个对应系统 / 架构上构建，自带运行环境；完成测试后发布 Release、安装脚本、五个安装包和 `SHA256SUMS`。任一构建失败都不会进入发布步骤。
@@ -109,8 +109,9 @@ Windows 原生包提供总览、会话 ID / 标题、资源与扩展版本、依
 本地只构建当前平台：
 
 ```sh
-uv pip install --python .venv/bin/python -e '.[ui,mcp]' pyinstaller==6.22.3
-.venv/bin/python scripts/build-release.py --target macos-arm64
+cargo test --locked
+cargo build --release --locked
+python3 scripts/build-release.py --target macos-arm64
 ```
 
 有 Docker 时，也可以在 Mac 上构建并验证 Linux 包：
@@ -120,18 +121,18 @@ bash scripts/build-linux-container.sh linux-arm64
 bash scripts/build-linux-container.sh linux-x64
 ```
 
-容器使用 Ubuntu 22.04，完成回归测试和可执行文件检查后把安装包写入 `dist/`，运行结束自动移除构建容器。Intel macOS 和 Windows 包仍应在对应系统构建。
+本地容器使用 Rust / Debian Bookworm 构建镜像（glibc 2.36+）；正式发布仍使用上方的 Ubuntu 22.04 CI 环境（glibc 2.35+），完成回归测试和可执行文件检查后把安装包写入 `dist/`，运行结束自动移除构建容器。Intel macOS 和 Windows 包仍应在对应系统构建。
 
-安装入口参考 [Mole 的脚本安装](https://github.com/tw93/mole/blob/main/install.sh)。发布包通过 [PyInstaller](https://pyinstaller.org/en/stable/) 打包解释器与依赖；各系统分别构建，不以跨平台压缩包替代原生二进制。
+安装入口参考 [Mole 的脚本安装](https://github.com/tw93/mole/blob/main/install.sh)。程序由 Cargo 编译为原生可执行文件，内嵌终端动画、HTML 模板和 MCP；不打包 Python 解释器。发布压缩包附有 `BUILD_INFO.json`，可用 `clean-my-agent --build-info` 核对版本、目标平台和源码摘要。打包辅助脚本需要 Python 3.11+，使用和安装程序不需要 Python。
 
 ## 源码开发安装
 
-仅参与开发时需要手动创建环境：
+源码开发需要 Rust 工具链：
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[ui,mcp]'
+cargo build --release --locked
+cargo test --locked
 ./clean-my-agent
 ```
 
-Windows 开发环境使用 `.venv\Scripts\python.exe -m pip install -e ".[ui,mcp]"`，再用 `.venv\Scripts\clean-my-agent.exe` 启动。发布包用户无需执行这些步骤。
+Windows 使用相同的 Cargo 构建命令，再用 `target\release\clean-my-agent.exe` 启动。发布包用户无需执行这些步骤。

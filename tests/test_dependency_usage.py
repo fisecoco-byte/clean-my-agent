@@ -11,7 +11,17 @@ from unittest.mock import patch
 from clean_my_agent import actions, dependency_report, deps, policy, storage, vault
 from clean_my_agent.scan import fingerprint, layout, scan
 
-CLI = Path(__file__).resolve().parents[1] / 'clean-my-agent'
+# Exercise the retained Python baseline; the root launcher now starts Rust.
+CLI = [sys.executable, '-m', 'clean_my_agent']
+
+
+def without_observation_time(value):
+    """Compare scan semantics, excluding only the new wall-clock observation stamp."""
+    if isinstance(value, dict):
+        return {k: without_observation_time(v) for k, v in value.items() if k != 'observed_at_ns'}
+    if isinstance(value, list):
+        return list(map(without_observation_time, value))
+    return value
 
 
 class Blocks(unittest.TestCase):
@@ -97,7 +107,7 @@ class References(unittest.TestCase):
         return subprocess.run(['git','-C',self.repo,*args],check=True,capture_output=True)
 
     def cli(self, *args, ok=True):
-        p = subprocess.run([sys.executable,CLI,*map(str,args)],text=True,capture_output=True)
+        p = subprocess.run([*CLI,*map(str,args)],text=True,capture_output=True)
         self.assertEqual(p.returncode == 0,ok,(p.stdout,p.stderr))
         return p.stdout
 
@@ -144,7 +154,7 @@ class References(unittest.TestCase):
         self.alias.symlink_to(alias)
         d = json.loads(self.cli('deps','--json'))
         s = json.loads(self.cli('scan','--agent','codex','--json'))
-        self.assertEqual(s['node_modules'],d)
+        self.assertEqual(without_observation_time(s['node_modules']), without_observation_time(d))
         r = next(r for r in d['entries'] if r['kind']=='directory')
         self.assertEqual(set(r['referenced_by']),{str(self.alias),str(alias)})
         self.assertEqual(r['status'],'retained')
@@ -191,11 +201,11 @@ class References(unittest.TestCase):
         baseline = dependency_report.inspect(self.root, policy.load())
         with patch.object(dependency_report, 'measure', side_effect=measuring):
             displayed = dependency_report.inspect(self.root, policy.load(), progress=update)
-        self.assertEqual(baseline, displayed)
+        self.assertEqual(without_observation_time(baseline), without_observation_time(displayed))
         self.assertEqual(displayed['entries'][0]['status'], 'retained')
         self.assertIn(('测量依赖目录', 1, 1, ''), events)
         self.assertEqual([(n, total) for label,n,total,_ in events if label=='复核工作树引用'],
-                         [(0,2), (1,2), (2,2)])
+                         [(0,2), (2,2)])
 
     def test_scan_progress_keeps_du_hardlink_accounting_across_folders(self):
         other = self.root / 'another' / 'linked-package'
