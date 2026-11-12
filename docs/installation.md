@@ -62,7 +62,7 @@ Unix 自定义 `ZDOTDIR`、`XDG_CONFIG_HOME` 时，安装与卸载应使用相�
 再次运行在线安装命令即更新到最新正式 Release。指定版本：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fisecoco-byte/clean-my-agent/main/install.sh | bash -s -- --version v0.4.1
+curl -fsSL https://raw.githubusercontent.com/fisecoco-byte/clean-my-agent/main/install.sh | bash -s -- --version v0.4.2
 ```
 
 Unix 卸载：
@@ -75,7 +75,7 @@ Windows 先下载脚本，再执行更新参数或卸载：
 
 ```powershell
 irm https://raw.githubusercontent.com/fisecoco-byte/clean-my-agent/main/install.ps1 -OutFile install.ps1
-.\install.ps1 -Version v0.4.1
+.\install.ps1 -Version v0.4.2
 # 卸载时运行：
 .\install.ps1 -Uninstall
 ```
@@ -98,8 +98,8 @@ Windows 原生包提供总览、会话 ID / 标题、资源与扩展版本、依
 3. 推送与版本一致的标签，例如：
 
    ```sh
-   git tag v0.4.1
-   git push origin v0.4.1
+   git tag v0.4.2
+   git push origin v0.4.2
    ```
 
 4. Actions 在五个对应系统 / 架构上构建，自带运行环境；完成测试后发布 Release、安装脚本、五个安装包和 `SHA256SUMS`。任一构建失败都不会进入发布步骤。

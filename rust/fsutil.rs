@@ -37,6 +37,23 @@ impl Info {
         (self.dev, self.ino)
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Directory,
+    Symlink,
+    Other,
+}
+impl Kind {
+    pub(crate) fn of(info: Info) -> Self {
+        if info.directory() {
+            Self::Directory
+        } else if info.symlink() {
+            Self::Symlink
+        } else {
+            Self::Other
+        }
+    }
+}
 pub fn now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -46,6 +63,16 @@ pub fn now_ns() -> i64 {
 }
 pub fn text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+/// Paths as report text. Names that are not UTF-8 are shown lossily instead of
+/// failing JSON serialization.
+pub fn texts(paths: &[PathBuf]) -> Vec<String> {
+    paths.iter().map(|p| text(p)).collect()
+}
+pub(crate) fn missing(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 pub fn printable(c: char) -> bool {
     static HIDDEN: std::sync::LazyLock<regex::Regex> =
@@ -259,24 +286,25 @@ mod platform {
             }
             Ok(info(unsafe { s.assume_init() }))
         }
-        pub fn names(&self) -> Result<Vec<OsString>> {
-            let dot = name(OsStr::new("."))?;
-            let fd = unsafe {
-                libc::openat(
-                    self.0.as_raw_fd(),
-                    dot.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                )
-            };
+        /// Sorted names with the `d_type` reported by the directory itself.
+        fn read(&self) -> Result<Vec<(OsString, u8)>> {
+            let fd = unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
             if fd < 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
-            let stream = unsafe { libc::fdopendir(fd) };
+            // The duplicate shares its offset with every earlier listing of this
+            // descriptor, so rewind before reading.
+            let stream = if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
+                std::ptr::null_mut()
+            } else {
+                unsafe { libc::fdopendir(fd) }
+            };
             if stream.is_null() {
+                let error = std::io::Error::last_os_error();
                 unsafe {
                     libc::close(fd);
                 }
-                return Err(std::io::Error::last_os_error().into());
+                return Err(error.into());
             }
             struct Stream(*mut libc::DIR);
             impl Drop for Stream {
@@ -307,14 +335,256 @@ mod platform {
                 }
                 let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
                 if bytes != b"." && bytes != b".." {
-                    result.push(OsString::from_vec(bytes.to_vec()));
+                    result.push((OsString::from_vec(bytes.to_vec()), unsafe {
+                        (*entry).d_type
+                    }));
                 }
             }
             result.sort();
             Ok(result)
         }
+        pub fn names(&self) -> Result<Vec<OsString>> {
+            Ok(self.read()?.into_iter().map(|(name, _)| name).collect())
+        }
+        /// Entry types without one `fstatat` per name. The type is only a hint:
+        /// callers still open directories with `O_NOFOLLOW`.
+        pub fn entries(&self) -> Result<Vec<(OsString, Kind)>> {
+            self.read()?
+                .into_iter()
+                .map(|(name, kind)| {
+                    let kind = match kind {
+                        libc::DT_DIR => Kind::Directory,
+                        libc::DT_LNK => Kind::Symlink,
+                        libc::DT_UNKNOWN => Kind::of(self.stat(&name)?),
+                        _ => Kind::Other,
+                    };
+                    Ok((name, kind))
+                })
+                .collect()
+        }
+        /// Names, types and metadata of everything that is not a directory.
+        /// Directories carry no metadata: callers `fstat` them after opening.
+        /// macOS reads the whole directory in bulk instead of one `fstatat` per
+        /// entry; entries the bulk call cannot describe exactly fall back to it.
+        pub fn listing(&self) -> Result<Vec<(OsString, Kind, Option<Info>)>> {
+            #[cfg(target_os = "macos")]
+            {
+                bulk::listing(self)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let mut result = Vec::new();
+                for (name, kind) in self.read()? {
+                    if kind == libc::DT_DIR {
+                        result.push((name, Kind::Directory, None));
+                    } else if let Some(entry) = self.described(name)? {
+                        result.push(entry);
+                    }
+                }
+                Ok(result)
+            }
+        }
+        /// One listing entry by `fstatat`; `None` when it vanished meanwhile.
+        fn described(&self, name: OsString) -> Result<Option<(OsString, Kind, Option<Info>)>> {
+            match self.stat(&name) {
+                Ok(info) if info.directory() => Ok(Some((name, Kind::Directory, None))),
+                Ok(info) => Ok(Some((name, Kind::of(info), Some(info)))),
+                Err(e) if missing(&e) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
         pub fn fd(&self) -> i32 {
             self.0.as_raw_fd()
+        }
+    }
+    #[cfg(target_os = "macos")]
+    mod bulk {
+        use super::*;
+        #[repr(C)]
+        struct Request {
+            count: u16,
+            reserved: u16,
+            common: u32,
+            volume: u32,
+            directory: u32,
+            file: u32,
+            fork: u32,
+        }
+        const NAME: u32 = 0x1;
+        const DEVICE: u32 = 0x2;
+        const TYPE: u32 = 0x8;
+        const MODIFIED: u32 = 0x400;
+        const ACCESS: u32 = 0x2_0000;
+        const FLAGS: u32 = 0x4_0000;
+        const FILE: u32 = 0x0200_0000;
+        const ERROR: u32 = 0x2000_0000;
+        const RETURNED: u32 = 0x8000_0000;
+        const LINKS: u32 = 0x1;
+        const ALLOCATED: u32 = 0x4;
+        const LENGTH: u32 = 0x200;
+        const REGULAR: u32 = 1;
+        const DIRECTORY: u32 = 2;
+        const LINK: u32 = 5;
+        /// `UF_COMPRESSED`: sizes of transparently compressed files are left to `fstatat`.
+        const COMPRESSED: u32 = 0x20;
+        struct Fields<'a>(&'a [u8], usize);
+        impl Fields<'_> {
+            fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
+                let bytes = self
+                    .0
+                    .get(self.1..self.1 + N)
+                    .context("目录批量读取结果不完整")?;
+                self.1 += N;
+                Ok(bytes.try_into().unwrap())
+            }
+            fn word(&mut self) -> Result<u32> {
+                Ok(u32::from_ne_bytes(self.take()?))
+            }
+            fn long(&mut self) -> Result<i64> {
+                Ok(i64::from_ne_bytes(self.take()?))
+            }
+        }
+        /// One record: its name and, when every field came back, the same values
+        /// `fstatat` reports. `None` metadata asks the caller for `fstatat`.
+        fn record(bytes: &[u8]) -> Result<(OsString, Option<u32>, Option<Info>)> {
+            let mut fields = Fields(bytes, 4);
+            let common = fields.word()?;
+            fields.take::<8>()?;
+            let file = fields.word()?;
+            fields.take::<4>()?;
+            let mut failed = false;
+            if common & ERROR != 0 {
+                failed = fields.word()? != 0;
+            }
+            if common & NAME == 0 {
+                bail!("目录批量读取结果缺少名称");
+            }
+            let start = fields.1;
+            let offset = i32::from_ne_bytes(fields.take()?);
+            let length = fields.word()? as usize;
+            let start = usize::try_from(start as i64 + offset as i64)
+                .ok()
+                .context("目录批量读取结果不完整")?;
+            let name = bytes
+                .get(start..start + length)
+                .context("目录批量读取结果不完整")?;
+            let name = name.split(|c| *c == 0).next().unwrap_or_default();
+            if name.is_empty() {
+                bail!("目录批量读取结果缺少名称");
+            }
+            let name = OsString::from_vec(name.to_vec());
+            let mut info = Info {
+                dev: 0,
+                ino: 0,
+                mode: 0,
+                links: 0,
+                size: 0,
+                allocated: 0,
+                modified_ns: 0,
+            };
+            let mut kind = None;
+            let mut complete = !failed;
+            if common & DEVICE != 0 {
+                info.dev = i32::from_ne_bytes(fields.take()?) as u64;
+            }
+            if common & TYPE != 0 {
+                kind = Some(fields.word()?);
+            }
+            if common & MODIFIED != 0 {
+                let seconds = fields.long()?;
+                info.modified_ns = seconds
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(fields.long()?);
+            }
+            if common & ACCESS != 0 {
+                info.mode = fields.word()? & 0o7777;
+            }
+            if common & FLAGS != 0 {
+                complete &= fields.word()? & COMPRESSED == 0;
+            }
+            if common & FILE != 0 {
+                info.ino = u64::from_ne_bytes(fields.take()?);
+            }
+            if file & LINKS != 0 {
+                info.links = fields.word()? as u64;
+            }
+            if file & ALLOCATED != 0 {
+                info.allocated = fields.long()?.max(0) as u64;
+            }
+            if file & LENGTH != 0 {
+                info.size = fields.long()?.max(0) as u64;
+            }
+            if failed {
+                return Ok((name, None, None));
+            }
+            match kind {
+                Some(REGULAR) => info.mode |= 0o100000,
+                Some(LINK) => info.mode |= 0o120000,
+                _ => complete = false,
+            }
+            complete &= common & (DEVICE | MODIFIED | ACCESS | FLAGS | FILE)
+                == DEVICE | MODIFIED | ACCESS | FLAGS | FILE
+                && file & (LINKS | ALLOCATED | LENGTH) == LINKS | ALLOCATED | LENGTH
+                && info.allocated.is_multiple_of(512);
+            Ok((name, kind, complete.then_some(info)))
+        }
+        pub fn listing(dir: &Directory) -> Result<Vec<(OsString, Kind, Option<Info>)>> {
+            // Earlier listings of this descriptor moved its offset.
+            if unsafe { libc::lseek(dir.fd(), 0, libc::SEEK_SET) } < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let mut request = Request {
+                count: 5,
+                reserved: 0,
+                common: RETURNED | NAME | DEVICE | TYPE | MODIFIED | ACCESS | FLAGS | FILE | ERROR,
+                volume: 0,
+                directory: 0,
+                file: LINKS | ALLOCATED | LENGTH,
+                fork: 0,
+            };
+            let mut buffer = vec![0u8; 1 << 16];
+            let mut result = Vec::new();
+            loop {
+                let count = unsafe {
+                    libc::getattrlistbulk(
+                        dir.fd(),
+                        (&mut request as *mut Request).cast(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                        0,
+                    )
+                };
+                if count < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                if count == 0 {
+                    break;
+                }
+                let mut rest = &buffer[..];
+                for _ in 0..count {
+                    let length = u32::from_ne_bytes(
+                        rest.get(..4)
+                            .context("目录批量读取结果不完整")?
+                            .try_into()
+                            .unwrap(),
+                    ) as usize;
+                    if length < 4 || length > rest.len() {
+                        bail!("目录批量读取结果不完整");
+                    }
+                    let (entry, next) = rest.split_at(length);
+                    rest = next;
+                    let (name, kind, info) = record(entry)?;
+                    if kind == Some(DIRECTORY) {
+                        result.push((name, Kind::Directory, None));
+                    } else if let Some(info) = info {
+                        result.push((name, Kind::of(info), Some(info)));
+                    } else if let Some(entry) = dir.described(name)? {
+                        result.push(entry);
+                    }
+                }
+            }
+            result.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(result)
         }
     }
     pub fn stat(path: &Path) -> Result<Info> {
@@ -448,6 +718,27 @@ mod platform {
             self.current()?;
             Ok(names)
         }
+        pub fn entries(&self) -> Result<Vec<(OsString, Kind)>> {
+            self.names()?
+                .into_iter()
+                .map(|name| {
+                    let kind = Kind::of(self.stat(&name)?);
+                    Ok((name, kind))
+                })
+                .collect()
+        }
+        pub fn listing(&self) -> Result<Vec<(OsString, Kind, Option<Info>)>> {
+            let mut result = Vec::new();
+            for name in self.names()? {
+                match self.stat(&name) {
+                    Ok(info) if info.directory() => result.push((name, Kind::Directory, None)),
+                    Ok(info) => result.push((name, Kind::of(info), Some(info))),
+                    Err(e) if missing(&e) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(result)
+        }
     }
     pub fn stat(path: &Path) -> Result<Info> {
         let file = open(path, false)?;
@@ -519,6 +810,42 @@ pub fn walk(
             if visit(&relative, &dir, &name, s)? == Visit::Descend && s.directory() {
                 let child = dir.child(&name)?;
                 if child.info()?.identity() != s.identity() {
+                    bail!("遍历期间目录已替换");
+                }
+                descend(&relative, child, progress, visit, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+    descend(Path::new(""), Directory::open(root)?, progress, visit, 0)
+}
+/// `walk` for callers that only need names, directories and links: entry types
+/// come from the directory listing instead of one metadata call per entry.
+pub fn walk_kinds(
+    root: &Path,
+    progress: &Progress,
+    visit: &mut impl FnMut(&Path, &std::ffi::OsStr, Kind) -> Result<Visit>,
+) -> Result<()> {
+    progress.check()?;
+    fn descend(
+        rel: &Path,
+        dir: Directory,
+        progress: &Progress,
+        visit: &mut impl FnMut(&Path, &std::ffi::OsStr, Kind) -> Result<Visit>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > 512 {
+            bail!("目录层级过深");
+        }
+        for (name, kind) in dir.entries()? {
+            name.to_str()
+                .context("目录含无法安全写入报告的文件名；保留")?;
+            progress.check()?;
+            let relative = rel.join(&name);
+            if visit(&relative, &name, kind)? == Visit::Descend && kind == Kind::Directory {
+                // A stale type cannot redirect the walk: the open refuses links.
+                let child = dir.child(&name)?;
+                if !child.info()?.directory() {
                     bail!("遍历期间目录已替换");
                 }
                 descend(&relative, child, progress, visit, depth + 1)?;
@@ -604,6 +931,115 @@ mod tests {
         assert_eq!(entries, vec![(PathBuf::from("link"), true)]);
         assert!(Directory::open(&root.join("tree/link")).is_err());
         assert!(regular_text(&root.join("tree/link/secret"), 100).is_err());
+    }
+    #[test]
+    fn listed_kinds_match_metadata_and_refuse_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        fs::create_dir_all(root.join("tree/dir/inner")).unwrap();
+        fs::create_dir(root.join("outside")).unwrap();
+        fs::write(root.join("outside/secret"), "private").unwrap();
+        fs::write(root.join("tree/file"), "x").unwrap();
+        symlink("../outside", root.join("tree/link")).unwrap();
+        let dir = Directory::open(&root.join("tree")).unwrap();
+        let expected: Vec<_> = dir
+            .names()
+            .unwrap()
+            .into_iter()
+            .map(|n| {
+                let kind = Kind::of(dir.stat(&n).unwrap());
+                (n, kind)
+            })
+            .collect();
+        // Repeated listings share one descriptor offset and must still be complete.
+        assert_eq!(dir.entries().unwrap(), expected);
+        assert_eq!(dir.entries().unwrap(), expected);
+        assert_eq!(dir.names().unwrap().len(), 3);
+        let mut entries = Vec::new();
+        walk_kinds(&root.join("tree"), &Progress::default(), &mut |r, _, k| {
+            entries.push((r.to_path_buf(), k));
+            Ok(Visit::Descend)
+        })
+        .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (PathBuf::from("dir"), Kind::Directory),
+                (PathBuf::from("dir/inner"), Kind::Directory),
+                (PathBuf::from("file"), Kind::Other),
+                (PathBuf::from("link"), Kind::Symlink),
+            ]
+        );
+        let progress = Progress::default();
+        progress.cancel();
+        assert!(walk_kinds(&root, &progress, &mut |_, _, _| Ok(Visit::Descend)).is_err());
+    }
+    fn listed(path: &Path) -> Vec<(OsString, Kind, Option<Info>)> {
+        let dir = Directory::open(path).unwrap();
+        let listing = dir.listing().unwrap();
+        let expected: Vec<_> = dir
+            .names()
+            .unwrap()
+            .into_iter()
+            .map(|name| {
+                let info = dir.stat(&name).unwrap();
+                let kind = Kind::of(info);
+                (name, kind, (!info.directory()).then_some(info))
+            })
+            .collect();
+        assert_eq!(listing, expected, "{}", path.display());
+        assert_eq!(dir.listing().unwrap(), expected);
+        assert_eq!(dir.names().unwrap().len(), expected.len());
+        listing
+    }
+    #[test]
+    fn bulk_listing_matches_one_stat_per_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("empty"), "").unwrap();
+        fs::write(root.join("data"), vec![b'x'; 70_000]).unwrap();
+        fs::hard_link(root.join("data"), root.join("hard")).unwrap();
+        File::create(root.join("sparse"))
+            .unwrap()
+            .set_len(1 << 24)
+            .unwrap();
+        fs::write(root.join("mode"), "x").unwrap();
+        fs::set_permissions(root.join("mode"), fs::Permissions::from_mode(0o4751)).unwrap();
+        symlink("data", root.join("short")).unwrap();
+        symlink("x".repeat(900), root.join("long")).unwrap();
+        symlink("dir", root.join("to-dir")).unwrap();
+        let fifo = std::ffi::CString::new(root.join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // A resource fork only exists on macOS volumes; elsewhere this is a no-op.
+        let _ = fs::write(root.join("data/..namedfork/rsrc"), vec![b'r'; 9000]);
+        for index in 0..700 {
+            fs::write(
+                root.join(format!("many-{index:04}-{}", "n".repeat(120))),
+                "x",
+            )
+            .unwrap();
+        }
+        let listing = listed(&root);
+        assert_eq!(listing.len(), 710);
+        assert!(listing.iter().any(|e| e.0 == "dir" && e.2.is_none()));
+        assert!(
+            listing
+                .iter()
+                .any(|e| e.0 == "to-dir" && e.1 == Kind::Symlink)
+        );
+        assert!(listed(&root.join("dir")).is_empty());
+        // Read-only system directories: compressed files, links and special modes.
+        // Not /dev: terminal devices change while the test prints.
+        for system in ["/usr/bin", "/usr/lib", "/etc", "/Applications"] {
+            let Ok(path) = fs::canonicalize(system) else {
+                continue;
+            };
+            if path.to_str().is_some() {
+                listed(&path);
+            }
+        }
     }
     #[test]
     fn resolve_link_then_parent() {

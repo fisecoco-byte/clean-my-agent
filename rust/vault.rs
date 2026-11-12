@@ -9,12 +9,18 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     io::Read,
     path::{Component, Path, PathBuf},
+    time::{Duration, Instant},
 };
 const CACHE_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55";
+/// How long one review of references, policy and running processes stands in
+/// for the dependency directories moved after it.
+pub const STAGE_REVIEW: Duration = Duration::from_secs(30);
+/// Permanent deletion accepts a shorter gap after its reference review.
+pub const PURGE_REVIEW: Duration = Duration::from_secs(10);
 fn string<'a>(item: &'a Value, key: &str) -> Result<&'a str> {
     item[key]
         .as_str()
@@ -146,6 +152,27 @@ pub fn save(
     policy: &Policy,
     progress: &Progress,
 ) -> Result<Saved> {
+    save_within(items, layout, policy, STAGE_REVIEW, progress)
+}
+/// The dependency rows of `report`, by path.
+fn reviewed(report: &Value) -> BTreeMap<PathBuf, Value> {
+    report["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| Some((PathBuf::from(row["path"].as_str()?), row.clone())))
+        .collect()
+}
+/// `save` with an explicit lifetime for the shared review. Directories are
+/// reviewed together once and again whenever the last review is older than
+/// `review`; identity and content are still compared right before each move.
+pub fn save_within(
+    items: &[Value],
+    layout: &Layout,
+    policy: &Policy,
+    review: Duration,
+    progress: &Progress,
+) -> Result<Saved> {
     if cfg!(windows) {
         bail!("Windows 原生版仅盘点");
     }
@@ -202,7 +229,10 @@ pub fn save(
         OsStr::new("manifest.json"),
     )?;
     fsops::sync(&batch)?;
+    let mut reviews: BTreeMap<String, (Instant, BTreeMap<PathBuf, Value>)> = BTreeMap::new();
     for (index, item) in prepared.iter().enumerate() {
+        let item_progress = progress.context(format!("暂存 {}/{}", index + 1, prepared.len()));
+        let progress = &item_progress;
         let moved = (|| -> Result<()> {
             progress.update(
                 "再次核对并暂存",
@@ -219,23 +249,68 @@ pub fn save(
             let src = fsops::directory(path.parent().context("缺少父目录")?, false)?;
             if item["category"] == "dependencies" {
                 let source = string(item, "source")?;
-                let report = dependency_report::inspect(
-                    &layout.roots[source],
-                    policy,
-                    true,
-                    Some(&path),
-                    source,
-                    &(vec![], vec![]),
-                    false,
-                    None,
-                    progress,
-                )?;
-                if report["errors"].as_array().is_some_and(|e| !e.is_empty())
-                    || report["entries"][0]["status"] != "candidate"
+                let root = &layout.roots[source];
+                if reviews
+                    .get(source)
+                    .is_none_or(|(at, rows)| at.elapsed() > review || !rows.contains_key(&path))
                 {
+                    reviews.remove(source);
+                    let mut paths = BTreeSet::from([path.clone()]);
+                    for later in &prepared[index + 1..] {
+                        if later["category"] == "dependencies"
+                            && later["source"] == item["source"]
+                            && let Ok(other) = origin(later, layout, false, progress)
+                            && fsutil::stat(&other).is_ok_and(|s| s.directory())
+                        {
+                            paths.insert(other);
+                        }
+                    }
+                    if paths.len() > 1 {
+                        let shared = progress.context(format!(
+                            "暂存 {}/{} · 移动前复核 {source}（{} 项）",
+                            index + 1,
+                            prepared.len(),
+                            paths.len()
+                        ));
+                        // A review that failed or is incomplete may be about another
+                        // directory; this one is then judged by its own review below.
+                        match dependency_report::inspect_selected(
+                            root, policy, &paths, source, &shared,
+                        ) {
+                            Ok(report)
+                                if report["errors"].as_array().is_some_and(|e| e.is_empty()) =>
+                            {
+                                reviews.insert(source.into(), (Instant::now(), reviewed(&report)));
+                            }
+                            _ => progress.check()?,
+                        }
+                    }
+                }
+                let row = match reviews.get(source).and_then(|(_, rows)| rows.get(&path)) {
+                    Some(row) => row.clone(),
+                    None => {
+                        let report = dependency_report::inspect_selected(
+                            root,
+                            policy,
+                            &BTreeSet::from([path.clone()]),
+                            source,
+                            progress,
+                        )?;
+                        if report["errors"].as_array().is_some_and(|e| !e.is_empty()) {
+                            bail!(
+                                "{}",
+                                report["entries"][0]["reason"]
+                                    .as_str()
+                                    .unwrap_or("引用或目录状态无法完整核实；未暂存")
+                            );
+                        }
+                        report["entries"][0].clone()
+                    }
+                };
+                if row["status"] != "candidate" {
                     bail!(
                         "{}",
-                        report["entries"][0]["reason"]
+                        row["reason"]
                             .as_str()
                             .unwrap_or("引用或目录状态无法完整核实；未暂存")
                     );
@@ -350,6 +425,9 @@ pub fn process(
             bail!("暂存区含未知文件，未执行");
         }
     }
+    // References and running processes, read once per data root and again when
+    // the last reading is older than the purge limit.
+    let mut reviews: BTreeMap<String, (Instant, deps::References, Snapshot)> = BTreeMap::new();
     for name in names {
         if name == "manifest.json" {
             continue;
@@ -374,13 +452,23 @@ pub fn process(
                 let original = origin(item, layout, false, progress)?;
                 if item["category"] == "dependencies" {
                     let source = string(item, "source")?;
-                    let refs = deps::References::read(&layout.roots[source], true, progress)?;
+                    if reviews
+                        .get(source)
+                        .is_none_or(|(at, ..)| at.elapsed() > PURGE_REVIEW)
+                    {
+                        reviews.remove(source);
+                        let refs = deps::References::read(&layout.roots[source], true, progress)?;
+                        let processes = Snapshot::read(progress);
+                        reviews.insert(source.into(), (Instant::now(), refs, processes));
+                    }
+                    let (_, refs, processes) = &reviews[source];
                     refs.guard(&original)?;
                     refs.guard(&physical)?;
                     deps::check_mounts(&physical)?;
-                    let (_, project) = deps::project_context(&original, progress)?;
+                    let (_, project) =
+                        deps::project_context(&original, &mut deps::Git::default(), progress)?;
                     project_types::require_evidence(&physical, &original, &project, progress)?;
-                    let runtime = Snapshot::read(progress).check(&physical, Some(&project));
+                    let runtime = processes.check(&physical, Some(&project));
                     if runtime["state"] != "idle" {
                         bail!("{}", runtime["reason"].as_str().unwrap_or("运行状态未知"));
                     }

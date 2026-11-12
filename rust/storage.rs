@@ -1,10 +1,15 @@
 use crate::{
     fsutil::{self, Directory, Info, Visit},
     progress::Progress,
+    survey::Observation,
 };
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use std::{collections::HashMap, ffi::OsStr, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 #[derive(Default, Clone)]
 pub struct DirectoryUsage {
@@ -27,22 +32,24 @@ impl DirectoryUsage {
         (self.bytes + self.links.values().sum::<u64>()).div_ceil(1024) * 1024
     }
 }
-pub fn workspace_usage(
+type Measured = BTreeMap<PathBuf, (Value, DirectoryUsage)>;
+/// Add everything below `path` on volume `dev`, reusing measured artifacts.
+fn add_tree(
     path: &Path,
-    measured: &std::collections::BTreeMap<std::path::PathBuf, (Value, DirectoryUsage)>,
+    dev: u64,
+    measured: &Measured,
+    usage: &mut DirectoryUsage,
     progress: &Progress,
-) -> Result<u64> {
-    let base = Directory::open(path)?.info()?;
-    let mut usage = DirectoryUsage::default();
-    usage.observe(base);
+    workspace: &Path,
+) -> Result<()> {
     let mut count = 0;
     fsutil::walk(path, progress, &mut |relative, _, _, s| {
-        if s.dev != base.dev {
+        if s.dev != dev {
             return Ok(Visit::Skip);
         }
         count += 1;
         if count % 2048 == 0 {
-            progress.update("统计工作树完整占用", None, None, fsutil::text(path))?;
+            progress.update("统计工作树完整占用", None, None, fsutil::text(workspace))?;
         }
         if s.directory()
             && let Some((stamp, cached)) = measured.get(&path.join(relative))
@@ -53,9 +60,51 @@ pub fn workspace_usage(
         }
         usage.observe(s);
         Ok(Visit::Descend)
-    })?;
+    })
+}
+pub fn workspace_usage(path: &Path, measured: &Measured, progress: &Progress) -> Result<u64> {
+    let base = Directory::open(path)?.info()?;
+    let mut usage = DirectoryUsage::default();
+    usage.observe(base);
+    add_tree(path, base.dev, measured, &mut usage, progress, path)?;
     if fsutil::stat(path)?.identity() != base.identity() {
         bail!("统计期间工作目录已替换");
+    }
+    Ok(usage.total())
+}
+/// `workspace_usage` from what the survey already counted: only the artifact
+/// directories it did not enter are added, measured ones without another walk.
+pub fn surveyed_usage(
+    path: &Path,
+    seen: &Observation,
+    measured: &Measured,
+    progress: &Progress,
+) -> Result<u64> {
+    let current = fsutil::stat(path)?.identity();
+    if seen.identity != Some(current) {
+        bail!("统计期间工作目录已替换");
+    }
+    let mut usage = seen.usage.clone();
+    for hole in &seen.holes {
+        let s = match fsutil::stat(hole) {
+            Ok(s) => s,
+            Err(e) if fsutil::missing(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        if s.dev != current.0 {
+            continue;
+        }
+        if s.directory()
+            && let Some((stamp, cached)) = measured.get(hole)
+            && s.stamp() == *stamp
+        {
+            usage.merge(cached);
+            continue;
+        }
+        usage.observe(s);
+        if s.directory() {
+            add_tree(hole, current.0, measured, &mut usage, progress, path)?;
+        }
     }
     Ok(usage.total())
 }

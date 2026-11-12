@@ -611,7 +611,69 @@ fn python_repr(value: &str) -> String {
     result.push(quote);
     result
 }
+/// Content fingerprint of a tree: name, mode, inode, size and modification time
+/// of every entry. Subdirectories are opened relative to their parent, never by
+/// path, so a directory swapped for a link below the root cannot redirect it.
 pub fn tree_digest(path: &Path, progress: &Progress) -> Result<String> {
+    let dev = fsutil::stat(path)?.dev;
+    let mut digest = Sha256::new();
+    fn walk(
+        dir: &fsutil::Directory,
+        relative: &Path,
+        dev: u64,
+        digest: &mut Sha256,
+        progress: &Progress,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > 512 {
+            bail!("目录层级过深");
+        }
+        let mut children = Vec::new();
+        for name in dir.names()? {
+            progress.check()?;
+            let s = dir.stat(&name)?;
+            if s.dev != dev {
+                bail!("包含其他挂载卷");
+            }
+            let rel = relative.join(&name);
+            digest.update(
+                format!(
+                    "({}, {}, {}, {}, {})",
+                    python_repr(&fsutil::text(&rel)),
+                    s.mode,
+                    s.ino,
+                    s.size,
+                    s.modified_ns
+                )
+                .as_bytes(),
+            );
+            if s.directory() {
+                name.to_str().context("路径编码无法安全写入报告；保留")?;
+                children.push((name, rel, s.identity()));
+            }
+        }
+        for (name, rel, identity) in children {
+            let child = dir.child(&name)?;
+            if child.info()?.identity() != identity {
+                bail!("遍历期间目录已替换");
+            }
+            walk(&child, &rel, dev, digest, progress, depth + 1)?;
+        }
+        Ok(())
+    }
+    walk(
+        &fsutil::Directory::open(path)?,
+        Path::new(""),
+        dev,
+        &mut digest,
+        progress,
+        0,
+    )?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+/// The previous algorithm, which reopened every subdirectory from the root.
+#[cfg(test)]
+fn tree_digest_by_path(path: &Path, progress: &Progress) -> Result<String> {
     let dev = fsutil::stat(path)?.dev;
     let mut digest = Sha256::new();
     fn walk(
@@ -658,6 +720,38 @@ pub fn tree_digest(path: &Path, progress: &Progress) -> Result<String> {
 #[cfg(test)]
 mod marker_tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn descriptor_digest_matches_the_path_based_digest() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("tree");
+        for dir in ["a/b/c", "a/d", "e", "空 目录/'quoted\"", "z"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in ["top", "a/one", "a/b/two", "a/b/c/three", "空 目录/文件"] {
+            fs::write(root.join(file), file).unwrap();
+        }
+        fs::hard_link(root.join("top"), root.join("e/hard")).unwrap();
+        symlink("a/b", root.join("link")).unwrap();
+        symlink("/nonexistent", root.join("a/dangling")).unwrap();
+        fs::set_permissions(root.join("a/one"), fs::Permissions::from_mode(0o640)).unwrap();
+        let progress = Progress::default();
+        let digest = tree_digest(&root, &progress).unwrap();
+        assert_eq!(digest, tree_digest_by_path(&root, &progress).unwrap());
+        assert_eq!(digest, tree_digest(&root, &progress).unwrap());
+        fs::write(root.join("a/b/c/three"), "changed").unwrap();
+        let changed = tree_digest(&root, &progress).unwrap();
+        assert_ne!(digest, changed);
+        assert_eq!(changed, tree_digest_by_path(&root, &progress).unwrap());
+        // A link in place of the root is refused, as before.
+        symlink(&root, root.with_file_name("alias")).unwrap();
+        assert!(tree_digest(&root.with_file_name("alias"), &progress).is_err());
+        assert!(tree_digest_by_path(&root.with_file_name("alias"), &progress).is_err());
+        progress.cancel();
+        assert!(tree_digest(&root, &progress).is_err());
+    }
     const SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55\n";
 
     #[test]

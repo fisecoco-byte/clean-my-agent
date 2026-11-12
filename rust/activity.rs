@@ -5,6 +5,7 @@ use crate::{
     process::Snapshot,
     progress::Progress,
     project_types,
+    survey::Observation,
 };
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -105,6 +106,29 @@ pub fn session_records(roots: &BTreeMap<String, PathBuf>) -> (Vec<Record>, Vec<S
     }
     (records, warnings)
 }
+fn gitdir(path: &Path, observe: &mut impl FnMut(i64, &str)) -> Result<()> {
+    let mut gitdir = path.join(".git");
+    if fsutil::stat(&gitdir).is_ok_and(|s| s.regular()) {
+        let text = fsutil::regular_text(&gitdir, 8192)?;
+        let pointer = text
+            .trim()
+            .strip_prefix("gitdir: ")
+            .ok_or_else(|| anyhow::anyhow!("Git 工作树元数据无法识别"))?;
+        gitdir = fsutil::resolve(&path.join(pointer))?;
+    }
+    if fsutil::stat(&gitdir).is_ok_and(|s| s.directory()) {
+        for name in ["HEAD", "index", "logs/HEAD"] {
+            let item = gitdir.join(name);
+            if let Ok(s) = fsutil::stat(&item)
+                && !s.symlink()
+            {
+                observe(s.modified_ns, "本工作树 Git 操作记录");
+            }
+        }
+    }
+    Ok(())
+}
+#[allow(clippy::too_many_arguments)] // One workspace, its evidence and limits.
 pub fn workspace(
     path: &Path,
     records: &[Record],
@@ -113,6 +137,7 @@ pub fn workspace(
     runtime: Option<&Value>,
     progress: &Progress,
     limit: usize,
+    seen: Option<&Observation>,
 ) -> Result<Value> {
     if runtime.is_some_and(|r| r["state"] == "busy") {
         return Ok(classify(Some(now), now, "", true, true, None));
@@ -136,6 +161,14 @@ pub fn workspace(
         let root = fsutil::stat(path)?;
         if !root.directory() {
             bail!("目录含符号链接或不可读取");
+        }
+        // The survey of the data areas already saw these files.
+        if let Some(seen) = seen.filter(|seen| seen.identity == Some(root.identity())) {
+            observe(seen.newest, "工作目录文件修改（不含依赖与构建目录）");
+            if seen.entries > limit {
+                bail!("文件数量超过活跃度检查上限");
+            }
+            return gitdir(path, &mut observe);
         }
         let mut count = 0;
         fsutil::walk(path, progress, &mut |relative, _, name, s| {
@@ -173,26 +206,7 @@ pub fn workspace(
             }
             Ok(Visit::Skip)
         })?;
-        let mut gitdir = path.join(".git");
-        if fsutil::stat(&gitdir).is_ok_and(|s| s.regular()) {
-            let text = fsutil::regular_text(&gitdir, 8192)?;
-            let pointer = text
-                .trim()
-                .strip_prefix("gitdir: ")
-                .ok_or_else(|| anyhow::anyhow!("Git 工作树元数据无法识别"))?;
-            gitdir = fsutil::resolve(&path.join(pointer))?;
-        }
-        if fsutil::stat(&gitdir).is_ok_and(|s| s.directory()) {
-            for name in ["HEAD", "index", "logs/HEAD"] {
-                let item = gitdir.join(name);
-                if let Ok(s) = fsutil::stat(&item)
-                    && !s.symlink()
-                {
-                    observe(s.modified_ns, "本工作树 Git 操作记录");
-                }
-            }
-        }
-        Ok(())
+        gitdir(path, &mut observe)
     })();
     if let Err(e) = collect {
         progress.check()?;
@@ -220,6 +234,7 @@ pub fn annotate(
     report: &mut Value,
     records: &(Vec<Record>, Vec<String>),
     processes: Option<&Snapshot>,
+    seen: &BTreeMap<PathBuf, Observation>,
     progress: &Progress,
 ) -> Result<()> {
     let now = fsutil::now_ns();
@@ -242,6 +257,7 @@ pub fn annotate(
             runtime.as_ref(),
             progress,
             50000,
+            seen.get(&path),
         )?;
     }
     let mut parents = projects.clone();
@@ -312,6 +328,7 @@ mod tests {
             None,
             &Progress::default(),
             50000,
+            None,
         )
         .unwrap();
         assert_eq!(info["level"], "unknown");
@@ -324,6 +341,7 @@ mod tests {
             None,
             &Progress::default(),
             50000,
+            None,
         )
         .unwrap();
         assert_eq!(info["level"], "high");

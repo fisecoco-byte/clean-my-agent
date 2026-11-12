@@ -140,6 +140,8 @@ fn ignored_artifacts(path: &Path, root: &Path, progress: &Progress) -> Result<Ve
         .filter(|r| !r.is_empty())
         .map(|r| std::str::from_utf8(r).map(|s| s.trim_end_matches('/').to_string()))
         .collect::<std::result::Result<_, _>>()?;
+    let mut git = deps::Git::default();
+    git.plan(entries.iter().map(|name| path.join(name)));
     for (index, name) in entries.iter().enumerate() {
         progress.update("核对忽略文件", Some(index), Some(entries.len()), name)?;
         let rel = Path::new(name);
@@ -161,8 +163,8 @@ fn ignored_artifacts(path: &Path, root: &Path, progress: &Progress) -> Result<Ve
         if !info.directory() || !project_types::target(&p) {
             bail!("存在不能自动丢弃的忽略文件：{name}");
         }
-        deps::verify(root, &p, progress)?;
-        let (_, project) = deps::project_context(&p, progress)?;
+        deps::verify(root, &p, &mut git, progress)?;
+        let (_, project) = deps::project_context(&p, &mut git, progress)?;
         project_types::require_evidence(&p, &p, &project, progress)?;
     }
     Ok(entries)

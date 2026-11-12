@@ -3,74 +3,131 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
     ffi::OsStr,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
 pub fn run(command: &mut Command, timeout: Duration, progress: &Progress) -> Result<Output> {
+    run_input(command, None, timeout, progress)
+}
+pub fn run_input(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+    progress: &Progress,
+) -> Result<Output> {
+    const LIMIT: u64 = 64 * 1024 * 1024;
     progress.check()?;
+    let _span = progress.span(&format!(
+        "子进程 {}",
+        Path::new(command.get_program())
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    ));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("无法启动 {}", command.get_program().to_string_lossy()))?;
+    if let Some(bytes) = input {
+        // Written concurrently with the output readers; a child that exits early
+        // closes the pipe and ends this thread.
+        let mut stdin = child.stdin.take().unwrap();
+        thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    fn reader(stream: impl Read + Send + 'static) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    let (done, finished) = mpsc::channel();
+    fn reader(
+        stream: impl Read + Send + 'static,
+        done: mpsc::Sender<()>,
+    ) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
         thread::spawn(move || {
             let mut bytes = Vec::new();
-            stream.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-            Ok(bytes)
+            let result = stream.take(LIMIT + 1).read_to_end(&mut bytes);
+            let _ = done.send(());
+            result.map(|_| bytes)
         })
     }
-    let out = reader(stdout);
-    let err = reader(stderr);
+    let out = reader(stdout, done.clone());
+    let err = reader(stderr, done);
+    let kill = |child: &std::process::Child| {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        let _ = child;
+    };
     let started = Instant::now();
+    let mut open = 2;
+    let mut pause = Duration::from_micros(50);
     let mut failure = None;
+    // Block on the output pipes instead of polling the child: both close when it
+    // exits. The short tick only bounds how long cancellation can go unnoticed.
     let status = loop {
-        if let Some(status) = child.try_wait()? {
+        if open == 0
+            && let Some(status) = child.try_wait()?
+        {
             break status;
         }
-        if progress.check().is_err() || started.elapsed() > timeout {
-            failure = Some(if started.elapsed() > timeout {
+        let elapsed = started.elapsed();
+        if progress.check().is_err() || elapsed > timeout {
+            if let Some(status) = child.try_wait()? {
+                // The command is gone but a descendant still holds its output.
+                failure = Some("命令输出未完成或已取消");
+                kill(&child);
+                break status;
+            }
+            failure = Some(if elapsed > timeout {
                 "命令执行超时"
             } else {
                 "操作已取消"
             });
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
+            kill(&child);
             let _ = child.kill();
             break child.wait()?;
         }
-        thread::sleep(Duration::from_millis(2));
-    };
-    while !out.is_finished() || !err.is_finished() {
-        if progress.check().is_err() || started.elapsed() > timeout {
-            failure = Some("命令输出未完成或已取消");
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
+        let tick = Duration::from_millis(20).min(timeout.saturating_sub(elapsed));
+        if open == 0 {
+            // Output closed before exit; the status follows almost immediately.
+            thread::sleep(pause.min(tick));
+            pause = (pause * 2).min(Duration::from_millis(2));
+        } else {
+            match finished.recv_timeout(tick.max(Duration::from_micros(50))) {
+                Ok(()) => open -= 1,
+                Err(mpsc::RecvTimeoutError::Timeout) => (),
+                Err(mpsc::RecvTimeoutError::Disconnected) => open = 0,
             }
-            break;
         }
-        thread::sleep(Duration::from_millis(2));
-    }
+    };
     if let Some(reason) = failure {
-        // A descendant may have detached while retaining a pipe. Do not block UI
-        // shutdown on its output reader; the pipe closes when that process exits.
-        if !out.is_finished() || !err.is_finished() {
-            bail!("{reason}");
+        // The killed group releases the pipes at once. A descendant may have
+        // detached while retaining one; do not block UI shutdown on its output
+        // reader, the pipe closes when that process exits.
+        let grace = Instant::now() + Duration::from_millis(100);
+        while open > 0 {
+            match finished.recv_timeout(grace.saturating_duration_since(Instant::now())) {
+                Ok(()) => open -= 1,
+                Err(_) => bail!("{reason}"),
+            }
         }
     }
     let stdout = out
@@ -82,7 +139,7 @@ pub fn run(command: &mut Command, timeout: Duration, progress: &Progress) -> Res
     if let Some(reason) = failure {
         bail!("{reason}");
     }
-    if stdout.len() > 64 * 1024 * 1024 || stderr.len() > 64 * 1024 * 1024 {
+    if stdout.len() as u64 > LIMIT || stderr.len() as u64 > LIMIT {
         bail!("命令输出超过读取上限");
     }
     Ok(Output {
@@ -122,6 +179,30 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("取消"));
     }
     #[test]
+    fn input_is_streamed_while_output_is_read() {
+        let input = vec![b'x'; 1 << 20];
+        let result = run_input(
+            &mut Command::new("cat"),
+            Some(input.clone()),
+            Duration::from_secs(30),
+            &Progress::default(),
+        )
+        .unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, input);
+    }
+    #[test]
+    fn output_held_by_a_descendant_is_not_trusted() {
+        let start = Instant::now();
+        let result = run(
+            Command::new("sh").args(["-c", "sleep 30 & echo done"]),
+            Duration::from_millis(200),
+            &Progress::default(),
+        );
+        assert!(result.unwrap_err().to_string().contains("未完成"));
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+    #[test]
     fn process_paths_are_not_substring_matches() {
         let process = Snapshot {
             files: vec![],
@@ -148,6 +229,14 @@ pub fn git(
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     progress: &Progress,
 ) -> Result<Output> {
+    git_input(repo, args, None, progress)
+}
+pub fn git_input(
+    repo: &Path,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    input: Option<Vec<u8>>,
+    progress: &Progress,
+) -> Result<Output> {
     let mut command = Command::new("git");
     command
         .args([
@@ -167,7 +256,7 @@ pub fn git(
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
-    run(&mut command, Duration::from_secs(30), progress)
+    run_input(&mut command, input, Duration::from_secs(30), progress)
 }
 pub fn checked_git(
     repo: &Path,

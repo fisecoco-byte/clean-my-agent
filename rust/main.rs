@@ -61,6 +61,9 @@ struct Args {
     include_history: bool,
     #[arg(long)]
     build_info: bool,
+    // Per-stage scan times on stderr; the report itself is unchanged.
+    #[arg(long, conflicts_with_all = ["apply", "from_report"])]
+    timings: bool,
 }
 fn run() -> Result<i32> {
     let args = Args::parse();
@@ -141,6 +144,9 @@ fn run() -> Result<i32> {
     {
         bail!("--from-report 仅用于只读查看已有依赖报告");
     }
+    if args.timings && args.command != "deps" {
+        bail!("--timings 仅用于 deps 报告");
+    }
     if args.path.is_some()
         && !matches!(
             args.command.as_str(),
@@ -196,6 +202,7 @@ fn run() -> Result<i32> {
         && !args.details
         && args.html.is_none()
         && args.path.is_none()
+        && !args.timings
         && tui::available();
     let page = match args.command.as_str() {
         "dashboard" | "home" | "scan" => Some(tui::Page::Home),
@@ -321,15 +328,29 @@ fn run() -> Result<i32> {
         )?,
         "deps" => {
             let layout = Layout::load()?;
+            let progress = if args.timings {
+                Progress::default().timed()
+            } else {
+                Progress::default()
+            };
+            let started = std::time::Instant::now();
             let mut data = dependency_report::inspect_agents(
                 &layout,
                 &policy,
                 &layout.selected(&args.agent),
                 args.path.as_deref().map(std::path::Path::new),
                 !args.quick,
-                &Progress::default(),
+                &progress,
                 None,
             )?;
+            if args.timings {
+                // Subprocess rows are also part of the stage that started them.
+                eprintln!("阶段耗时（秒 / 次数）");
+                for (name, spent, count) in progress.timings() {
+                    eprintln!("{:>10.3}  {count:>7}  {name}", spent.as_secs_f64());
+                }
+                eprintln!("{:>10.3}  {:>7}  合计", started.elapsed().as_secs_f64(), 1);
+            }
             if args.apply {
                 let row = data["entries"][0].clone();
                 if row["status"] != "candidate" || !data["errors"].as_array().unwrap().is_empty() {

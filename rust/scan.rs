@@ -6,7 +6,11 @@ use crate::{
 use anyhow::Result;
 use regex::Regex;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::Path, sync::LazyLock};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
 
 static LOG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^.+\.log(?:\.\d+(?:\.gz)?)?$").unwrap());
@@ -247,57 +251,101 @@ pub fn scan(
         }
         #[cfg(unix)]
         if !folded.is_empty() {
-            // One native invocation preserves hard-link accounting across top-level trees.
-            progress.update("统计目录占用", Some(0), Some(folded.len()), source)?;
-            let run = crate::process::run(
-                std::process::Command::new("du")
-                    .args(["-k", "-s", "-x"])
-                    .args(&folded),
-                std::time::Duration::from_secs(300),
-                progress,
-            );
-            match run {
-                Ok(output) => {
-                    let mut done = 0;
-                    for line in output.stdout.split(|c| *c == b'\n') {
-                        if let Some(tab) = line.iter().position(|c| *c == b'\t') {
-                            let amount = std::str::from_utf8(&line[..tab])
-                                .ok()
-                                .and_then(|s| s.parse::<u64>().ok());
-                            let path = String::from_utf8_lossy(&line[tab + 1..]);
-                            if let (Some(amount), Some(folder)) =
-                                (amount, folded.iter().find(|p| p.to_string_lossy() == path))
-                            {
-                                let size = amount * 1024;
-                                out.folders.insert(path.into_owned(), size);
-                                let category = classify(
-                                    source,
-                                    &Path::new(folder.file_name().unwrap()).join("_"),
-                                );
-                                out.rows.entry((agent.into(), category.into())).or_default()[1] +=
-                                    size;
-                                done += 1;
-                                progress.update(
-                                    "统计目录占用",
-                                    Some(done),
-                                    Some(folded.len()),
-                                    source,
-                                )?;
-                            }
-                        }
-                    }
-                    if !output.status.success() || done != folded.len() {
-                        out.errors.push(format!(
-                            "{} 有目录无法完整统计；结果为部分占用",
-                            root.display()
-                        ));
-                    }
-                }
-                Err(e) => out.errors.push(e.to_string()),
+            let (sizes, failed) = folded_sizes(&folded, progress, source)?;
+            if failed {
+                out.errors.push(format!(
+                    "{} 有目录无法完整统计；结果为部分占用",
+                    root.display()
+                ));
+            }
+            for (folder, size) in sizes {
+                let key = fsutil::text(&folder);
+                let category = classify(source, &Path::new(folder.file_name().unwrap()).join("_"));
+                out.rows.entry((agent.into(), category.into())).or_default()[1] += size;
+                out.folders.insert(key, size);
             }
         }
     }
     Ok(out)
+}
+/// Sizes of the top-level directories skipped by the walk, in the manner of one
+/// `du -k -s -x` run: a file hard-linked into two of them counts under the first
+/// one reached. Allocation blocks and device bounds are the same as `du`'s, so
+/// the totals agree. A directory that cannot be read completely reports what was
+/// seen and sets `incomplete`; only cancellation is an error.
+#[cfg(unix)]
+fn folded_sizes(
+    folded: &[PathBuf],
+    progress: &Progress,
+    source: &str,
+) -> Result<(BTreeMap<PathBuf, u64>, bool)> {
+    let mut links = std::collections::BTreeSet::new();
+    let mut sizes = BTreeMap::new();
+    let mut incomplete = false;
+    for (index, folder) in folded.iter().enumerate() {
+        progress.update("统计目录占用", Some(index), Some(folded.len()), source)?;
+        let _span = progress.span("折叠目录占用");
+        let initial = match fsutil::stat(folder) {
+            Ok(s) => s,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        let mut bytes = initial.allocated;
+        if let Ok(dir) = fsutil::Directory::open(folder) {
+            if let Err(e) = tally(&dir, initial.dev, progress, &mut bytes, &mut links, 0) {
+                progress.check()?;
+                let _ = e;
+                incomplete = true;
+            }
+        } else {
+            incomplete = true;
+        }
+        sizes.insert(folder.clone(), bytes.div_ceil(1024) * 1024);
+    }
+    Ok((sizes, incomplete))
+}
+/// The same entries `walk` visits, read with one directory listing per folder so
+/// a file's metadata does not cost a separate system call. Directories are still
+/// opened without following links and checked against the device bound.
+#[cfg(unix)]
+fn tally(
+    dir: &fsutil::Directory,
+    root_dev: u64,
+    progress: &Progress,
+    bytes: &mut u64,
+    links: &mut std::collections::BTreeSet<(u64, u64)>,
+    depth: usize,
+) -> Result<()> {
+    if depth > 512 {
+        anyhow::bail!("目录层级过深");
+    }
+    for (name, kind, info) in dir.listing()? {
+        progress.check()?;
+        if kind == fsutil::Kind::Directory {
+            let child = dir.child(&name)?;
+            let own = child.info()?;
+            if own.dev != root_dev {
+                continue;
+            }
+            if !own.directory() {
+                anyhow::bail!("遍历期间目录已替换");
+            }
+            *bytes += own.allocated;
+            tally(&child, root_dev, progress, bytes, links, depth + 1)?;
+            continue;
+        }
+        let info = match info {
+            Some(info) => info,
+            None => dir.stat(&name)?,
+        };
+        if info.dev != root_dev || (info.links > 1 && !links.insert(info.identity())) {
+            continue;
+        }
+        *bytes += info.allocated;
+    }
+    Ok(())
 }
 impl Scan {
     pub fn groups(&self) -> Vec<Value> {
@@ -342,5 +390,61 @@ impl Scan {
             );
         }
         result
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::symlink};
+    /// The same directories in one `du -k -s -x` run: a hard link shared by two
+    /// of them is accounted once, by whichever comes first.
+    #[test]
+    fn folded_sizes_match_one_native_du_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (a, b) = (root.join("a"), root.join("b"));
+        fs::create_dir_all(a.join("sub")).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("file"), vec![b'x'; 12345]).unwrap();
+        fs::hard_link(a.join("file"), b.join("alias")).unwrap();
+        fs::hard_link(a.join("file"), a.join("sub/third")).unwrap();
+        fs::write(b.join("other"), vec![b'y'; 9000]).unwrap();
+        fs::File::create(a.join("sparse"))
+            .unwrap()
+            .set_len(1 << 22)
+            .unwrap();
+        symlink("/etc/passwd", a.join("link")).unwrap();
+        fs::create_dir(root.join("empty")).unwrap();
+        let folded = vec![a.clone(), b.clone(), root.join("empty")];
+        let progress = Progress::default().timed();
+        let (sizes, incomplete) = folded_sizes(&folded, &progress, "codex").unwrap();
+        assert!(!incomplete);
+        let output = std::process::Command::new("du")
+            .args(["-k", "-s", "-x"])
+            .args(&folded)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let native: BTreeMap<PathBuf, u64> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (amount, path) = line.split_once('\t').unwrap();
+                (
+                    root.join(
+                        Path::new(path)
+                            .strip_prefix(&root)
+                            .expect("du reports the paths it was given"),
+                    ),
+                    amount.parse::<u64>().unwrap() * 1024,
+                )
+            })
+            .collect();
+        assert_eq!(sizes, native);
+        // Cancellation is reported, not treated as an unreadable directory.
+        let cancelled = Progress::default();
+        cancelled.cancel();
+        assert!(folded_sizes(&folded, &cancelled, "codex").is_err());
     }
 }

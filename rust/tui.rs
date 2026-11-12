@@ -23,7 +23,7 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::{self, IsTerminal},
     path::Path,
     sync::{
@@ -220,10 +220,17 @@ struct Dialog {
     body: String,
     scroll: u16,
 }
+struct SavedHome {
+    agent: String,
+    data: Loaded,
+    table: TableState,
+    query: String,
+}
 pub struct App {
     settings: Settings,
     page: Page,
     data: Loaded,
+    saved_home: Option<SavedHome>,
     rows: Vec<Value>,
     table: TableState,
     checked: BTreeSet<String>,
@@ -268,6 +275,7 @@ impl App {
             settings,
             page,
             data: Loaded::default(),
+            saved_home: None,
             rows: Vec::new(),
             table: TableState::default().with_selected(0),
             checked: BTreeSet::new(),
@@ -302,7 +310,129 @@ impl App {
     fn busy(&self) -> bool {
         self.pending || self.worker.is_some()
     }
+    fn scan_notice(&mut self) {
+        let n = self.data.doc["errors"].as_array().map_or(0, Vec::len);
+        self.notice = if n > 0 {
+            format!("{n} 条扫描提示 · ? 查看；涉及未核实内容的操作保持关闭")
+        } else {
+            String::new()
+        };
+    }
     fn reload(&mut self) {
+        // Explicit refreshes also invalidate the parent overview, whose totals
+        // may no longer match what the child page is about to discover.
+        self.saved_home = None;
+        self.start_scan();
+    }
+    /// Applies a finished action to the rows already on screen: the entries it
+    /// reported as moved disappear and their projects are recounted, instead of
+    /// walking the whole page again. Everything left keeps the result of its
+    /// last check, which is why the notice says what was and was not redone.
+    fn settle(&mut self, doc: &Value) {
+        // The overview totals are derived from this page, so they are rescanned
+        // on return even though the page itself is not.
+        self.saved_home = None;
+        let mut moved: BTreeSet<String> = doc["moved_paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|path| path.as_str().map(str::to_string))
+            .collect();
+        if let Some(path) = doc["path"].as_str() {
+            moved.insert(path.into());
+        }
+        // Sessions change state rather than path, and a result without paths
+        // says nothing about which rows it touched.
+        if self.page == Page::Home || self.page == Page::Sessions || moved.is_empty() {
+            self.reload();
+            return;
+        }
+        let page = self.page;
+        // File rows carry a short path under their data root; every other page
+        // lists absolute paths.
+        let key = |row: &Value| -> Option<String> {
+            let path = match page {
+                Page::Files => Path::new(row["root"].as_str()?).join(row["path"].as_str()?),
+                _ => Path::new(row["path"].as_str()?).to_path_buf(),
+            };
+            Some(path.to_string_lossy().into_owned())
+        };
+        // A removed worktree takes the artifacts inside it along.
+        let projects: BTreeSet<String> = self.data.doc["projects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row["path"].as_str().map(str::to_string))
+            .filter(|path| moved.contains(path))
+            .collect();
+        let mut removed = Vec::new();
+        let mut take = |rows: &mut Vec<Value>, under_project: bool| {
+            rows.retain(|row| match key(row) {
+                Some(path) => {
+                    let gone = moved.contains(&path)
+                        || (under_project
+                            && projects.iter().any(|p| Path::new(&path).starts_with(p)));
+                    if gone {
+                        removed.push(row.clone());
+                    }
+                    !gone
+                }
+                None => true,
+            });
+        };
+        if let Some(rows) = self.data.doc["entries"].as_array_mut() {
+            take(rows, true);
+        }
+        if let Some(rows) = self.data.doc["items"].as_array_mut() {
+            take(rows, false);
+        }
+        if let Some(rows) = self.data.doc["projects"].as_array_mut() {
+            rows.retain(|row| !key(row).is_some_and(|path| moved.contains(&path)));
+        }
+        let artifacts: Vec<String> = self.data.doc["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row["path"].as_str().map(str::to_string))
+            .collect();
+        // Measured sizes lose only what the operation reported as moved out.
+        let gone: BTreeMap<&str, u64> = removed
+            .iter()
+            .filter_map(|row| {
+                Some((
+                    row["project"].as_str()?,
+                    row["directory_bytes"].as_u64().unwrap_or(0),
+                ))
+            })
+            .fold(BTreeMap::new(), |mut sums, (project, bytes)| {
+                *sums.entry(project).or_default() += bytes;
+                sums
+            });
+        for project in self.data.doc["projects"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
+            let repo = project["path"].as_str().unwrap_or_default().to_string();
+            let moved = gone.get(repo.as_str()).copied();
+            project["artifacts"] = json!(
+                artifacts
+                    .iter()
+                    .filter(|path| {
+                        let path = Path::new(path);
+                        path == Path::new(&repo)
+                            || (path != Path::new(&repo) && path.starts_with(&repo))
+                    })
+                    .count()
+            );
+            if let (Some(bytes), Some(moved)) = (project["directory_bytes"].as_u64(), moved) {
+                project["directory_bytes"] = json!(bytes.saturating_sub(moved));
+            }
+        }
+        self.notice = "已按操作结果更新列表；其余内容沿用上次核查，r 可完整刷新".into();
+        self.rebuild();
+    }
+    fn start_scan(&mut self) {
         self.worker.take();
         self.pending = true;
         self.scan_complete = false;
@@ -320,6 +450,16 @@ impl App {
         self.started = Instant::now();
     }
     fn navigate(&mut self, page: Page) {
+        // Only retain a finished overview. A cancelled or failed scan must
+        // still show loading and retry when the user returns.
+        if self.page == Page::Home && self.scan_complete && !self.busy() {
+            self.saved_home = Some(SavedHome {
+                agent: self.settings.agent.clone(),
+                data: std::mem::take(&mut self.data),
+                table: self.table,
+                query: self.query.clone(),
+            });
+        }
         self.page = page;
         if page == Page::Sessions {
             self.session_agent = if self.settings.agent == "claude" {
@@ -343,7 +483,19 @@ impl App {
         self.query.clear();
         self.group = 1;
         self.dialog = None;
-        self.reload();
+        self.start_scan();
+        if page == Page::Home
+            && let Some(saved) = self.saved_home.take()
+            && saved.agent == self.settings.agent
+        {
+            self.data = saved.data;
+            self.table = saved.table;
+            self.query = saved.query;
+            self.pending = false;
+            self.scan_complete = true;
+            self.scan_notice();
+            self.rebuild();
+        }
     }
     fn launch(&mut self) {
         if !self.pending {
@@ -394,7 +546,18 @@ impl App {
                             })
                         }
                         Ok(Outcome::Done(doc)) => {
-                            self.reload();
+                            // A clean finish lets the page keep its rows minus
+                            // what moved; any uncertainty rewrites it.
+                            let clean = doc["errors"].as_array().is_none_or(|e| e.is_empty())
+                                && doc["status"].as_str().is_none_or(|s| s == "succeeded")
+                                && doc["results"].as_array().is_none_or(|rows| {
+                                    rows.iter().all(|r| r["status"] == "succeeded")
+                                });
+                            if clean {
+                                self.settle(&doc);
+                            } else {
+                                self.reload();
+                            }
                             self.dialog = Some(Dialog {
                                 title: "操作结果".into(),
                                 body: multiline(&ui_actions::result_body(&doc)),
@@ -402,7 +565,9 @@ impl App {
                             });
                         }
                         Err(e) => {
-                            self.reload();
+                            // A failed read-only review does not change the
+                            // overview. Writes invalidate it before they start.
+                            self.start_scan();
                             self.dialog = Some(Dialog {
                                 title: "操作未完成".into(),
                                 body: multiline(&format!("{e:#}\n请根据刷新后的状态核对结果。")),
@@ -421,12 +586,7 @@ impl App {
                         Ok(data) => {
                             self.data = data;
                             self.scan_complete = true;
-                            let n = self.data.doc["errors"].as_array().map_or(0, Vec::len);
-                            self.notice = if n > 0 {
-                                format!("{n} 条扫描提示 · ? 查看；涉及未核实内容的操作保持关闭")
-                            } else {
-                                String::new()
-                            };
+                            self.scan_notice();
                             self.rebuild();
                         }
                         Err(e) => {
@@ -810,6 +970,10 @@ impl App {
     where
         F: FnOnce(Settings, Progress) -> Result<Outcome> + Send + 'static,
     {
+        if writing {
+            // Even failed writes can have partially changed files.
+            self.saved_home = None;
+        }
         let (update_tx, updates) = mpsc::channel();
         let (message_tx, messages) = mpsc::channel();
         let progress = Progress::new(update_tx);
@@ -1316,7 +1480,11 @@ impl App {
                 } else {
                     String::new()
                 },
-                if self.busy() {
+                if self.writing {
+                    " · 正在执行操作，请等待完成"
+                } else if self.busy() && self.scan_complete {
+                    " · 执行前核对中，文件操作暂不可用"
+                } else if self.busy() {
                     " · 后台扫描中，文件操作暂不可用"
                 } else {
                     ""
@@ -1347,15 +1515,23 @@ impl App {
             self.render_table(frame, layout[4]);
         }
         let phase = if self.busy() {
+            let elapsed = self.started.elapsed().as_secs();
+            let counts = match (self.phase.done, self.phase.total) {
+                (Some(done), Some(total)) if total > 0 => format!(" {done}/{total}"),
+                _ => String::new(),
+            };
             format!(
-                "{}{} · {} · {}",
+                "{}{} · {:02}:{:02} · {}{} · {}",
                 if self.notice.is_empty() {
                     String::new()
                 } else {
                     format!("{}\n", self.notice)
                 },
                 ["◐", "◓", "◑", "◒"][(self.started.elapsed().as_millis() / 100) as usize % 4],
+                elapsed / 60,
+                elapsed % 60,
                 safe(&self.phase.phase),
+                counts,
                 safe(&self.phase.detail)
             )
         } else if !self.notice.is_empty() {
@@ -1720,6 +1896,35 @@ mod tests {
         assert!(app.checked.is_empty());
     }
     #[test]
+    fn cleanup_progress_shows_action_counts_and_elapsed_time() {
+        let mut app = workspaces();
+        app.pending = true;
+        app.writing = true;
+        app.phase = Update {
+            phase: "暂存 2/3 · 复核工作树引用".into(),
+            done: Some(4),
+            total: Some(22),
+            detail: "已检查 2048 项 · /fixture/repo".into(),
+        };
+        app.started = Instant::now() - Duration::from_secs(65);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(text.contains("正在执行操作"));
+        assert!(!text.contains("后台扫描中"));
+        assert!(text.contains("01:05"));
+        assert!(text.contains("暂存2/3·复核工作树引用4/22"));
+        assert!(text.contains("已检查2048项"));
+    }
+    #[test]
     fn failure_is_distinct_from_empty_success() {
         let mut app = App::new(settings(), Page::Dependencies);
         app.pending = false;
@@ -1765,6 +1970,244 @@ mod tests {
     }
     fn press(app: &mut App, c: char) {
         app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    fn finished_home() -> App {
+        let mut app = App::new(settings(), Page::Home);
+        app.pending = false;
+        app.scan_complete = true;
+        app.data.doc = json!({
+            "groups":[{"agent":"codex","category":"logs","bytes":8192}],
+            "errors":[], "measured_at":"original observation"
+        });
+        app.rebuild();
+        app.table.select(Some(2)); // caches and old logs
+        app
+    }
+    #[test]
+    fn browsing_children_restores_overview_without_starting_a_scan() {
+        let mut app = finished_home();
+        let original = app.data.doc.clone();
+        for page in [
+            Page::Files,
+            Page::Resources,
+            Page::Dependencies,
+            Page::Sessions,
+            Page::Extensions,
+            Page::Batches,
+        ] {
+            app.navigate(page);
+            assert!(app.pending); // child still gets its own initial scan
+            app.back(); // returning during a child scan is also supported
+            assert_eq!(app.page, Page::Home);
+            assert!(!app.busy());
+            assert!(app.scan_complete);
+            assert_eq!(app.data.doc, original);
+            assert_eq!(app.current().unwrap()["route"], "clean");
+            app.launch();
+            assert!(app.worker.is_none());
+        }
+        app.open();
+        assert_eq!(app.page, Page::Files);
+
+        // Completed reports retain their warnings too, without retrying the
+        // same inaccessible paths on every return from a read-only page.
+        let mut app = finished_home();
+        app.data.doc["errors"] = json!(["fixture inaccessible directory"]);
+        app.scan_notice();
+        let notice = app.notice.clone();
+        app.navigate(Page::Files);
+        app.back();
+        assert!(!app.busy());
+        assert_eq!(app.notice, notice);
+        assert_eq!(app.data.doc["errors"].as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn unfinished_or_failed_overviews_are_not_reused() {
+        for case in 0..2 {
+            let mut app = finished_home();
+            match case {
+                0 => app.pending = true,
+                _ => app.scan_complete = false,
+            }
+            app.navigate(Page::Files);
+            app.back();
+            assert!(app.pending);
+            assert!(!app.scan_complete);
+            assert!(app.data.doc.is_null());
+        }
+    }
+    #[test]
+    fn refreshes_and_agent_changes_do_not_restore_old_totals() {
+        let mut app = finished_home();
+        app.navigate(Page::Files);
+        app.pending = false;
+        app.scan_complete = true;
+        press(&mut app, 'r');
+        app.back();
+        assert!(app.pending);
+        assert!(app.data.doc.is_null());
+
+        let mut app = finished_home();
+        app.navigate(Page::Files);
+        app.back();
+        press(&mut app, 'r');
+        assert!(app.pending);
+        assert!(app.data.doc.is_null());
+
+        let mut app = finished_home();
+        press(&mut app, '2');
+        assert_eq!(app.settings.agent, "claude");
+        app.navigate(Page::Files);
+        app.back();
+        assert!(app.pending);
+        assert!(app.data.doc.is_null());
+
+        let mut app = finished_home();
+        app.navigate(Page::Files);
+        app.settings.agent = "all".into();
+        app.back();
+        assert!(app.pending);
+        assert!(app.data.doc.is_null());
+    }
+    fn finish_action(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.worker.is_some() && Instant::now() < deadline {
+            app.receive();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.worker.is_none());
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        press(app, 'q');
+        assert_eq!(app.page, Page::Home);
+    }
+    #[test]
+    fn successful_and_failed_writes_invalidate_the_overview() {
+        for failed in [false, true] {
+            let mut app = finished_home();
+            app.navigate(Page::Files);
+            app.pending = false;
+            app.scan_complete = true;
+            app.spawn_action(true, move |_, _| {
+                if failed {
+                    bail!("fixture partial write failure");
+                }
+                Ok(Outcome::Done(json!({"moved_files":1})))
+            });
+            finish_action(&mut app);
+            assert!(app.pending);
+            assert!(!app.scan_complete);
+            assert!(app.data.doc.is_null());
+        }
+    }
+    #[test]
+    fn finished_actions_drop_moved_rows_without_another_walk() {
+        fn finished(app: &mut App) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.worker.is_some() && Instant::now() < deadline {
+                app.receive();
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(app.worker.is_none());
+        }
+        let mut app = workspaces();
+        app.spawn_action(true, |_, _| {
+            Ok(Outcome::Done(
+                json!({"status":"succeeded","path":"/fixture/beta"}),
+            ))
+        });
+        finished(&mut app);
+        // The whole worktree left, with the artifact it carried.
+        assert!(!app.busy());
+        assert!(app.scan_complete);
+        assert_eq!(
+            app.data.doc["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|p| p["path"].as_str())
+                .collect::<Vec<_>>(),
+            ["/fixture/alpha", "/fixture/alpha-other"]
+        );
+        assert!(
+            app.data.doc["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| !e["path"].as_str().unwrap().starts_with("/fixture/beta"))
+        );
+        assert!(app.notice.contains("沿用上次核查"));
+        // Artifact counts follow the rows that remain.
+        app.workspace_view = true;
+        app.rebuild();
+        let alpha = app
+            .rows
+            .iter()
+            .find(|r| r["path"] == "/fixture/alpha")
+            .unwrap();
+        assert_eq!(alpha["artifacts"], 2);
+        assert_eq!(
+            app.rows
+                .iter()
+                .filter(|r| r["path"] == "/fixture/alpha-other")
+                .count(),
+            1
+        );
+
+        // A moved artifact also shortens its worktree's measured size.
+        let mut app = workspaces();
+        app.data.doc["entries"][0]["directory_bytes"] = json!(4096);
+        app.data.doc["entries"][0]["project"] = json!("/fixture/alpha");
+        app.data.doc["projects"][0]["directory_bytes"] = json!(8192);
+        app.spawn_action(true, |_, _| {
+            Ok(Outcome::Done(
+                json!({"moved_paths":["/fixture/alpha/target"]}),
+            ))
+        });
+        finished(&mut app);
+        assert_eq!(app.data.doc["projects"][0]["directory_bytes"], 4096);
+        assert_eq!(app.data.doc["projects"][0]["artifacts"], 1);
+        assert!(
+            app.data.doc["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["path"] != "/fixture/alpha/target")
+        );
+
+        // Uncertain results still refresh everything.
+        let mut app = workspaces();
+        app.spawn_action(true, |_, _| {
+            Ok(Outcome::Done(
+                json!({"status":"uncertain","path":"/fixture/beta"}),
+            ))
+        });
+        finished(&mut app);
+        assert!(app.pending);
+        assert!(app.data.doc.is_null());
+    }
+    #[test]
+    fn cancelled_confirmations_and_failed_reviews_keep_the_overview() {
+        let mut app = finished_home();
+        let original = app.data.doc.clone();
+        app.navigate(Page::Files);
+        app.prompt(Prompt {
+            title: "Review".into(),
+            body: "Fixture".into(),
+            phrase: "STAGE",
+            request: Request::Stage(Page::Files, vec![]),
+        });
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.back();
+        assert!(!app.busy());
+        assert_eq!(app.data.doc, original);
+
+        app.navigate(Page::Dependencies);
+        app.pending = false;
+        app.scan_complete = true;
+        app.spawn_action(false, |_, _| bail!("fixture review failure"));
+        finish_action(&mut app);
+        assert!(!app.busy());
+        assert_eq!(app.data.doc, original);
     }
     #[test]
     #[cfg(not(windows))]

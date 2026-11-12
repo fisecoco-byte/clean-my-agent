@@ -64,11 +64,12 @@ pub fn stage_artifacts(
     }
     policy.current()?;
     let mut identities = BTreeSet::new();
+    let mut groups = BTreeMap::<&str, BTreeSet<std::path::PathBuf>>::new();
     let mut items = Vec::new();
-    for (index, old) in selected.iter().enumerate() {
+    for old in selected {
         let path = Path::new(old["path"].as_str().context("产物缺少路径")?);
         let source = old["agent"].as_str().unwrap_or("codex");
-        let root = layout.roots.get(source).context("产物来源未知")?;
+        layout.roots.get(source).context("产物来源未知")?;
         if !identities.insert(path.to_path_buf())
             || old["status"] != "candidate"
             || old["kind"] != "directory"
@@ -83,28 +84,39 @@ pub fn stage_artifacts(
         {
             bail!("不能同时选择父目录与其子产物");
         }
-        progress.update(
-            "重新核对所选产物",
-            Some(index),
-            Some(selected.len()),
-            fsutil::text(path),
-        )?;
-        let report = dependency_report::inspect(
-            root,
+        groups.entry(source).or_default().insert(path.into());
+    }
+    let mut checked = BTreeMap::new();
+    for (source, paths) in groups {
+        let review = progress.context(format!("暂存前复核 {source}（{} 项）", paths.len()));
+        let report = dependency_report::inspect_selected(
+            &layout.roots[source],
             policy,
-            true,
-            Some(path),
+            &paths,
             source,
-            &(vec![], vec![]),
-            false,
-            None,
-            progress,
+            &review,
         )?;
-        let row = &report["entries"][0];
-        if report["errors"].as_array().is_some_and(|a| !a.is_empty())
-            || row["status"] != "candidate"
-            || row["stamp"] != old["stamp"]
-        {
+        if report["errors"].as_array().is_some_and(|a| !a.is_empty()) {
+            bail!("产物复核不完整，未暂存：{}", report["errors"]);
+        }
+        for row in report["entries"].as_array().context("产物复核缺少结果")? {
+            checked.insert(
+                (
+                    source,
+                    row["path"].as_str().context("产物缺少路径")?.to_owned(),
+                ),
+                row.clone(),
+            );
+        }
+    }
+    for old in selected {
+        let path = Path::new(old["path"].as_str().unwrap());
+        let source = old["agent"].as_str().unwrap_or("codex");
+        let root = &layout.roots[source];
+        let row = checked
+            .get(&(source, fsutil::text(path)))
+            .context("产物已不在复核范围内")?;
+        if row["status"] != "candidate" || row["stamp"] != old["stamp"] {
             bail!(
                 "所选产物已变化，未暂存：{} · {}",
                 path.display(),
@@ -197,6 +209,18 @@ pub fn quarantine_preview(
     selected: &[Value],
     progress: &Progress,
 ) -> Result<Value> {
+    quarantine_check(layout, operation, selected, operation, progress)
+}
+/// The preview document for `selected`. `action` is the vault check behind it:
+/// the operation itself for a full preview, or "list" to confirm only that the
+/// batches still hold the same entries.
+fn quarantine_check(
+    layout: &Layout,
+    operation: &str,
+    selected: &[Value],
+    action: &str,
+    progress: &Progress,
+) -> Result<Value> {
     if !["restore", "purge"].contains(&operation) || selected.is_empty() {
         bail!("请先用空格勾选暂存条目");
     }
@@ -222,15 +246,7 @@ pub fn quarantine_preview(
                     .context("无效条目编号")
             })
             .collect::<Result<Vec<_>>>()?;
-        let current = vault::process(
-            layout,
-            &key,
-            operation,
-            false,
-            None,
-            Some(&indices),
-            progress,
-        )?;
+        let current = vault::process(layout, &key, action, false, None, Some(&indices), progress)?;
         if !current.errors.is_empty() {
             bail!("{}", current.errors.join("；"));
         }
@@ -255,10 +271,13 @@ pub fn quarantine_preview(
 pub fn quarantine_apply(layout: &Layout, expected: &Value, progress: &Progress) -> Result<Value> {
     writes()?;
     let operation = expected["operation"].as_str().context("无效操作")?;
-    let fresh = quarantine_preview(
+    // The entries must still be the previewed ones. Policy, references, running
+    // processes and content are then checked once, as each entry is processed.
+    let fresh = quarantine_check(
         layout,
         operation,
         expected["selected"].as_array().context("缺少选择")?,
+        "list",
         progress,
     )?;
     if fresh != *expected {
@@ -266,6 +285,7 @@ pub fn quarantine_apply(layout: &Layout, expected: &Value, progress: &Progress) 
     }
     let mut count = 0;
     let mut errors = Vec::new();
+    let mut moved = Vec::new();
     for batch in fresh["batches"].as_array().unwrap() {
         let key = batch["batch"].as_str().unwrap();
         progress.update(
@@ -288,6 +308,13 @@ pub fn quarantine_apply(layout: &Layout, expected: &Value, progress: &Progress) 
             Ok(result) => {
                 count += result.count;
                 errors.extend(result.errors);
+                moved.extend(
+                    result.detail["entries"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|row| row["path"].as_str().map(str::to_string)),
+                );
             }
             Err(e) => errors.push(e.to_string()),
         }
@@ -295,7 +322,7 @@ pub fn quarantine_apply(layout: &Layout, expected: &Value, progress: &Progress) 
             break;
         }
     }
-    Ok(json!({"operation":operation,"count":count,"errors":errors}))
+    Ok(json!({"operation":operation,"count":count,"moved_paths":moved,"errors":errors}))
 }
 pub fn sessions(
     layout: &Layout,

@@ -17,7 +17,7 @@
 
 Inspect **Codex, Claude Code and T3** storage from one terminal dashboard. Find large worktrees, review inactive sessions, and clean eligible caches, old logs and rebuildable project artifacts. Known caches and old versions of other agents are available in the resource inventory.
 
-**v0.4.1 is the native Rust release:** the CLI, scanner, terminal interface and MCP run in one executable. [Release notes](docs/releases/v0.4.1.md).
+**v0.4.2 is the native Rust release:** the CLI, scanner, terminal interface and MCP run in one executable. This version brings a full dependency report down from about 459 s to about 83–100 s. [Release notes](docs/releases/v0.4.2.md).
 
 ## Features
 
@@ -145,7 +145,7 @@ To review removal of an **entire directory**, select exactly one directory and p
 
 Press `s` to switch sorting and `Enter` to inspect the evidence. Worktrees and sessions start with the least recently active items; artifacts start with estimated reclaimable space. Selection is preserved when sorting. Activity is an estimate, not permission to delete.
 
-Scanning shows a cat animation, elapsed time and real progress when a count is known. Small windows use a one-line animation. The worktree/artifact view lists discovered directories first, then fills in measurements and checks; cleanup becomes available after measurement completes. Opening a page starts a scan; `r` rescans and file operations refresh the results. An empty result is shown only after scanning completes; failures show an error.
+Scanning shows a cat animation, elapsed time and real progress when a count is known. Small windows use a one-line animation. The worktree/artifact view lists discovered directories first, then fills in measurements and checks; cleanup becomes available after measurement completes. Opening the overview or a child page starts a scan. Returning after browsing restores the completed overview and cursor position immediately. Pressing `r`, switching agents, or executing file operations invalidates the saved overview so its totals are measured again. An empty result is shown only after scanning completes; failures show an error.
 
 <details>
 <summary>Session selection and inactivity thresholds</summary>
@@ -212,7 +212,7 @@ Detailed guides are currently in Chinese; both READMEs cover the same core workf
 | [Mole comparison](docs/mole-reference.md) | Pinned upstream rules and implementation boundaries |
 | [Scan performance](docs/scan-performance.md) | Measurement behavior and reproducible benchmarks |
 | [Rust migration](docs/rust-migration.md) | Compatibility checks and migration validation |
-| [v0.4.1 release notes](docs/releases/v0.4.1.md) | Native runtime and workspace cleanup changes |
+| [v0.4.2 release notes](docs/releases/v0.4.2.md) | Faster scanning and review |
 
 <details>
 <summary>Develop from source</summary>
