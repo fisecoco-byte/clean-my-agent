@@ -672,7 +672,7 @@ pub fn tree_digest(path: &Path, progress: &Progress) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 /// The previous algorithm, which reopened every subdirectory from the root.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn tree_digest_by_path(path: &Path, progress: &Progress) -> Result<String> {
     let dev = fsutil::stat(path)?.dev;
     let mut digest = Sha256::new();

@@ -6,11 +6,9 @@ use crate::{
 use anyhow::Result;
 use regex::Regex;
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::LazyLock,
-};
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 
 static LOG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^.+\.log(?:\.\d+(?:\.gz)?)?$").unwrap());
